@@ -1,4 +1,7 @@
-#include <sys/ptrace.h>
+#ifndef _LINUX_USER_H
+#define _LINUX_USER_H
+
+#include <linux/ptrace.h>
 /* Core file format: The core file is written in such a way that gdb
    can understand it and provide useful information to the user (under
    linux we use the 'trad-core' bfd).  There are quite a number of
@@ -62,8 +65,11 @@ struct user{
   struct pt_regs * u_ar0;	/* Used by gdb to help find the values for */
 				/* the registers. */
   struct user_i387_struct* u_fpstate;	/* Math Co-processor pointer. */
+  unsigned long magic;		/* To uniquely identify a core file */
 };
 #define NBPG 4096
 #define UPAGES 1
 #define HOST_TEXT_START_ADDR (u.start_code)
 #define HOST_STACK_END_ADDR (u.start_stack + u.u_ssize * NBPG)
+
+#endif
