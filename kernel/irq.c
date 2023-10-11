@@ -26,12 +26,71 @@
 #include <linux/errno.h>
 #include <linux/signal.h>
 #include <linux/sched.h>
+#include <linux/interrupt.h>
 
 #include <asm/system.h>
 #include <asm/io.h>
 #include <asm/irq.h>
 
+
 void irq13(void);
+
+static unsigned long intr_count=0;
+
+/* I'll use an array for speed. and bitmap for speed. */
+int bh_active=0;
+struct bh_struct bh_base[32]; 
+
+/* interrupts should be on at the interrupt priority controller level. */
+/* returns with interrupts off at the processor level. */
+
+void do_bottom_half(void)
+{
+	struct bh_struct *bh;
+	int mask;
+	int count;
+	static int in_bh = 0;
+
+	cli();
+	if (intr_count > 1) {
+		intr_count--;
+		return;
+	}
+  /* don't just decrement it in case it is already 0 */
+
+	intr_count = 0;
+
+  /* any sort of real time test should go here. */
+	if (in_bh != 0) {
+		return;
+	}
+
+	in_bh = 1;
+	do {
+		count = 0;
+		for (mask = 1, bh = bh_base; mask ; bh++, mask = mask << 1) {
+			if (mask > bh_active)
+				break;
+			if (!(mask & bh_active))
+				continue;
+
+			count++;
+			bh_active &= ~mask;
+
+			/* turn the interrupts back on. */
+			sti();
+
+			if (bh->routine != NULL)
+				bh->routine(bh->data);
+			else
+				printk ("irq.c:bad bottom half entry.\n");
+
+		/* and back off. */
+			cli();
+		}
+	} while (count > 0);
+	in_bh = 0;
+}
 
 /*
  * This builds up the IRQ handler stubs using some ugly macros in irq.h
@@ -115,16 +174,15 @@ static struct sigaction irq_sigaction[16] = {
 /*
  * do_IRQ handles IRQ's that have been installed without the
  * SA_INTERRUPT flag: it uses the full signal-handling return
- * and runs with other interrupts disabled. All relatively slow
+ * and runs with other interrupts enabled. All relatively slow
  * IRQ's should use this format: notably the keyboard/timer
  * routines.
  */
-int do_IRQ(int irq, struct pt_regs * regs)
+void do_IRQ(int irq, struct pt_regs * regs)
 {
 	struct sigaction * sa = irq + irq_sigaction;
 
 	sa->sa_handler((int) regs);
-	return 0;		/* re-enable the irq when returning */
 }
 
 /*
@@ -132,12 +190,11 @@ int do_IRQ(int irq, struct pt_regs * regs)
  * stuff - the handler is also running with interrupts disabled unless
  * it explicitly enables them later.
  */
-int do_fast_IRQ(int irq)
+void do_fast_IRQ(int irq)
 {
 	struct sigaction * sa = irq + irq_sigaction;
 
-	sa->sa_handler(0);
-	return 0;		/* re-enable the irq when returning */
+	sa->sa_handler(irq);
 }
 
 int irqaction(unsigned int irq, struct sigaction * new)
@@ -152,7 +209,8 @@ int irqaction(unsigned int irq, struct sigaction * new)
 		return -EBUSY;
 	if (!new->sa_handler)
 		return -EINVAL;
-	__asm__ __volatile__("pushfl ; popl %0 ; cli":"=r" (flags));
+	save_flags(flags);
+	cli();
 	*sa = *new;
 	sa->sa_mask = 1;
 	if (sa->sa_flags & SA_INTERRUPT)
@@ -165,7 +223,7 @@ int irqaction(unsigned int irq, struct sigaction * new)
 		outb(inb_p(0x21) & ~(1<<2),0x21);
 		outb(inb_p(0xA1) & ~(1<<(irq-8)),0xA1);
 	}
-	__asm__ __volatile__("pushl %0 ; popfl"::"r" (flags));
+	restore_flags(flags);
 	return 0;
 }
 		
@@ -193,7 +251,8 @@ void free_irq(unsigned int irq)
 		printk("Trying to free free IRQ%d\n",irq);
 		return;
 	}
-	__asm__ __volatile__("pushfl ; popl %0 ; cli":"=r" (flags));
+	save_flags(flags);
+	cli();
 	if (irq < 8)
 		outb(inb_p(0x21) | (1<<irq),0x21);
 	else
@@ -203,7 +262,7 @@ void free_irq(unsigned int irq)
 	sa->sa_flags = 0;
 	sa->sa_mask = 0;
 	sa->sa_restorer = NULL;
-	__asm__ __volatile__("pushl %0 ; popfl"::"r" (flags));
+	restore_flags(flags);
 }
 
 extern void do_coprocessor_error(long,long);
@@ -233,4 +292,13 @@ void init_IRQ(void)
 		printk("Unable to get IRQ2 for cascade\n");
 	if (request_irq(13,math_error_irq))
 		printk("Unable to get IRQ13 for math-error handler\n");
+
+	/* intialize the bottom half routines. */
+	for (i = 0; i < 32; i++)
+	  {
+	    bh_base[i].routine = NULL;
+	    bh_base[i].data = NULL;
+	  }
+	bh_active = 0;
+
 }

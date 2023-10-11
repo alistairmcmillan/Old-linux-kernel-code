@@ -45,6 +45,7 @@ static struct file_operations def_blk_fops = {
 	NULL,		/* readdir */
 	NULL,		/* select */
 	NULL,		/* ioctl */
+	NULL,		/* mmap */
 	blkdev_open,	/* open */
 	NULL,		/* release */
 };
@@ -62,6 +63,6 @@ struct inode_operations ext_blkdev_inode_operations = {
 	NULL,			/* rename */
 	NULL,			/* readlink */
 	NULL,			/* follow_link */
-	ext_bmap,		/* bmap */
-	ext_truncate		/* truncate */
+	NULL,			/* bmap */
+	NULL			/* truncate */
 };

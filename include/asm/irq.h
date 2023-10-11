@@ -110,19 +110,19 @@ void BAD_IRQ_NAME(nr); \
 __asm__( \
 "\n.align 2\n" \
 "_IRQ" #nr "_interrupt:\n\t" \
-	"pushl $-1\n\t" \
+	"pushl $-"#nr"-2\n\t" \
 	SAVE_ALL \
 	ACK_##chip(mask) \
+	"incl _intr_count\n\t"\
 	"sti\n\t" \
 	"movl %esp,%ebx\n\t" \
 	"pushl %ebx\n\t" \
 	"pushl $" #nr "\n\t" \
 	"call _do_IRQ\n\t" \
 	"addl $8,%esp\n\t" \
-	"testl %eax,%eax\n\t" \
-	"jne ret_from_sys_call\n\t" \
 	"cli\n\t" \
 	UNBLK_##chip(mask) \
+	"call _do_bottom_half\n\t"\
 	"jmp ret_from_sys_call\n" \
 "\n.align 2\n" \
 "_fast_IRQ" #nr "_interrupt:\n\t" \
@@ -131,11 +131,8 @@ __asm__( \
 	"pushl $" #nr "\n\t" \
 	"call _do_fast_IRQ\n\t" \
 	"addl $4,%esp\n\t" \
-	"testl %eax,%eax\n\t" \
-	"jne 2f\n\t" \
 	"cli\n\t" \
 	UNBLK_##chip(mask) \
-	"\n2:\t" \
 	RESTORE_MOST \
 "\n\n.align 2\n" \
 "_bad_IRQ" #nr "_interrupt:\n\t" \

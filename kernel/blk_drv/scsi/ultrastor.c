@@ -1,5 +1,5 @@
 /*
- *	ultrastor.c	Copyright (C) 1991, 1992 David B. Gentzel
+ *	ultrastor.c	Copyright (C) 1992 David B. Gentzel
  *	Low-level SCSI driver for UltraStor 14F
  *	by David B. Gentzel, Whitfield Software Services, Carnegie, PA
  *	    (gentzel@nova.enet.dec.com)
@@ -24,19 +24,14 @@
 /*
  * CAVEATS: ???
  *    This driver is VERY stupid.  It takes no advantage of much of the power
- *    of the UltraStor controller.  We just sit-and-spin while waiting for
- *    commands to complete.  I hope to go back and beat it into shape, but
- *    PLEASE, anyone else who would like to, please make improvements!
+ *    of the UltraStor controller.  I hope to go back and beat it into shape,
+ *    but PLEASE, anyone else who would like to, please make improvements!
  *
  *    By defining NO_QUEUEING in ultrastor.h, you disable the queueing feature
  *    of the mid-level SCSI driver.  Once I'm satisfied that the queueing
  *    version is as stable as the non-queueing version, I'll eliminate this
  *    option.
  */
-
-#include <linux/config.h>
-
-#ifdef CONFIG_SCSI_ULTRASTOR
 
 #include <linux/stddef.h>
 #include <linux/string.h>
@@ -45,13 +40,15 @@
 
 #include <asm/io.h>
 #include <asm/system.h>
+#include <asm/dma.h>
 
 #define ULTRASTOR_PRIVATE	/* Get the private stuff from ultrastor.h */
-#include "ultrastor.h"
+#include "../blk.h"
 #include "scsi.h"
 #include "hosts.h"
+#include "ultrastor.h"
 
-#define VERSION "1.0 beta"
+#define VERSION "1.1 alpha"
 
 #define ARRAY_SIZE(arr) (sizeof (arr) / sizeof (arr)[0])
 #define BIT(n) (1ul << (n))
@@ -149,15 +146,18 @@ static int host_number;
 
 static volatile int aborted = 0;
 
+/* A probe of address 0x310 screws up NE2000 cards */
+
 #ifndef PORT_OVERRIDE
 static const unsigned short ultrastor_ports[] = {
-    0x330, 0x340, 0x310, 0x230, 0x240, 0x210, 0x130, 0x140,
+    0x330, 0x340, /* 0x310,*/  0x230, 0x240, 0x210, 0x130, 0x140,
 };
 #endif
 
-void ultrastor_interrupt(void);
+static void ultrastor_interrupt(int cpl);
 
-static void (*ultrastor_done)(int, int) = 0;
+static void (*ultrastor_done)(Scsi_Cmnd *) = 0;
+static Scsi_Cmnd *SCint = NULL;
 
 static const struct {
     const char *signature;
@@ -291,29 +291,36 @@ int ultrastor_14f_detect(int hostnum)
 #endif
     host_number = hostnum;
     scsi_hosts[hostnum].this_id = config.ha_scsi_id;
+
 #ifndef NO_QUEUEING
-    set_intr_gate(0x20 + config.interrupt, ultrastor_interrupt);
-    /* gate to PIC 2 */
-    outb_p(inb_p(0x21) & ~BIT(2), 0x21);
-    /* enable the interrupt */
-    outb(inb_p(0xA1) & ~BIT(config.interrupt - 8), 0xA1);
+    if (request_irq(config.interrupt, ultrastor_interrupt)) {
+	printk("Unable to allocate IRQ%u for UltraStor controller.\n",
+	       config.interrupt);
+	return FALSE;
+    }
 #endif
+    if (request_dma(config.dma_channel)) {
+	printk("Unable to allocate DMA channel %u for UltraStor controller.\n",
+	       config.dma_channel);
+#ifndef NO_QUEUEING
+	free_irq(config.interrupt);
+#endif
+	return FALSE;
+    }
+
     return TRUE;
 }
 
 const char *ultrastor_14f_info(void)
 {
-    return "UltraStor 14F SCSI driver version "
-	   VERSION
-	   " by David B. Gentzel\n";
+    return "UltraStor 14F SCSI driver version " VERSION;
 }
 
 static struct mscp mscp = {
-    OP_SCSI, DTD_SCSI, FALSE, TRUE, FALSE	/* This stuff doesn't change */
+    OP_SCSI, DTD_SCSI, 0, 1, 0		/* This stuff doesn't change */
 };
 
-int ultrastor_14f_queuecommand(unsigned char target, const void *cmnd,
-			       void *buff, int bufflen, void (*done)(int, int))
+int ultrastor_14f_queuecommand(Scsi_Cmnd *SCpnt, void (*done)(Scsi_Cmnd *))
 {
     unsigned char in_byte;
 
@@ -323,12 +330,13 @@ int ultrastor_14f_queuecommand(unsigned char target, const void *cmnd,
 
     /* Skip first (constant) byte */
     memset((char *)&mscp + 1, 0, sizeof (struct mscp) - 1);
-    mscp.target_id = target;
-    /* mscp.lun = ???; */
-    mscp.transfer_data = *(Longword *)&buff;
-    mscp.transfer_data_length = *(Longword *)&bufflen,
-    mscp.length_of_scsi_cdbs = ((*(unsigned char *)cmnd <= 0x1F) ? 6 : 10);
-    memcpy(mscp.scsi_cdbs, cmnd, mscp.length_of_scsi_cdbs);
+    mscp.target_id = SCpnt->target;
+    mscp.lun = SCpnt->lun;
+    mscp.transfer_data = *(Longword *)&SCpnt->request_buffer;
+    mscp.transfer_data_length = *(Longword *)&SCpnt->request_bufflen;
+    mscp.length_of_scsi_cdbs
+	= ((*(unsigned char *)SCpnt->cmnd <= 0x1F) ? 6 : 10);
+    memcpy(mscp.scsi_cdbs, SCpnt->cmnd, mscp.length_of_scsi_cdbs);
 
     /* Find free OGM slot (OGMINT bit is 0) */
     do
@@ -352,6 +360,7 @@ int ultrastor_14f_queuecommand(unsigned char target, const void *cmnd,
     outb_p(0x1, LCL_DOORBELL_INTR(PORT_ADDRESS));
 
     ultrastor_done = done;
+    SCint = SCpnt;
 
 #if (ULTRASTOR_DEBUG & UD_COMMAND)
     printk("US14F: queuecommand: returning\n");
@@ -361,8 +370,7 @@ int ultrastor_14f_queuecommand(unsigned char target, const void *cmnd,
 }
 
 #ifdef NO_QUEUEING
-int ultrastor_14f_command(unsigned char target, const void *cmnd,
-			  void *buff, int bufflen)
+int ultrastor_14f_command(Scsi_Cmnd SCpnt)
 {
     unsigned char in_byte;
 
@@ -370,7 +378,7 @@ int ultrastor_14f_command(unsigned char target, const void *cmnd,
     printk("US14F: command: called\n");
 #endif
 
-    (void)ultrastor_14f_queuecommand(target, cmnd, buff, bufflen, 0);
+    (void)ultrastor_14f_queuecommand(SCpnt, NULL);
 
     /* Wait for ICM interrupt */
     do
@@ -397,7 +405,7 @@ int ultrastor_14f_command(unsigned char target, const void *cmnd,
 }
 #endif
 
-int ultrastor_14f_abort(int code)
+int ultrastor_14f_abort(Scsi_Cmnd *SCpnt, int code)
 {
 #if (ULTRASTOR_DEBUG & UD_ABORT)
     printk("US14F: abort: called\n");
@@ -412,6 +420,10 @@ int ultrastor_14f_abort(int code)
     return 0;
 }
 
+/* Most of this is commented out because people were getting kernel crashes
+   with it enabled.  If you want to re-enable this, please figure out why
+   the kernel was panicing. ERY */
+
 int ultrastor_14f_reset(void)
 {
     unsigned char in_byte;
@@ -420,6 +432,7 @@ int ultrastor_14f_reset(void)
     printk("US14F: reset: called\n");
 #endif
 
+#if 0
     /* Issue SCSI BUS reset */
     outb_p(0x20, LCL_DOORBELL_INTR(PORT_ADDRESS));
 
@@ -429,7 +442,7 @@ int ultrastor_14f_reset(void)
     while (in_byte & 0x20);
 
     aborted = DID_RESET;
-
+#endif
 #if (ULTRASTOR_DEBUG & UD_RESET)
     printk("US14F: reset: returning\n");
 #endif
@@ -437,17 +450,17 @@ int ultrastor_14f_reset(void)
 }
 
 #ifndef NO_QUEUEING
-void ultrastor_interrupt_service(void)
+static void ultrastor_interrupt(int cpl)
 {
 #if (ULTRASTOR_DEBUG & UD_INTERRUPT)
-    printk("US14F: interrupt_service: called: status = %08X\n",
+    printk("US14F: interrupt: called: status = %08X\n",
 	   (mscp.adapter_status << 16) | mscp.target_status);
 #endif
 
     if (ultrastor_done == 0)
-	panic("US14F: interrupt_service: unexpected interrupt!\n");
+	panic("US14F: interrupt: unexpected interrupt!\n");
     else {
-	void (*done)(int, int);
+	void (*done)(Scsi_Cmnd *);
 
 	/* Save ultrastor_done locally and zero before calling.  This is needed
 	   as once we call done, we may get another command queued before this
@@ -460,44 +473,12 @@ void ultrastor_interrupt_service(void)
 
 	/* Let the higher levels know that we're done */
 	/* ??? status is wrong here... */
-	done(host_number, (mscp.adapter_status << 16) | mscp.target_status);
+	SCint->result = (mscp.adapter_status << 16) | mscp.target_status;
+	done(SCint);
     }
 
 #if (ULTRASTOR_DEBUG & UD_INTERRUPT)
-    printk("US14F: interrupt_service: returning\n");
+    printk("US14F: interrupt: returning\n");
 #endif
 }
-
-__asm__("
-_ultrastor_interrupt:
-	cld
-	pushl %eax
-	pushl %ecx
-	pushl %edx
-	push %ds
-	push %es
-	push %fs
-	movl $0x10,%eax
-	mov %ax,%ds
-	mov %ax,%es
-	movl $0x17,%eax
-	mov %ax,%fs
-	movb $0x20,%al
-	outb %al,$0xA0		# EOI to interrupt controller #1
-	outb %al,$0x80		# give port chance to breathe
-	outb %al,$0x80
-	outb %al,$0x80
-	outb %al,$0x80
-	outb %al,$0x20
-	call _ultrastor_interrupt_service
-	pop %fs
-	pop %es
-	pop %ds
-	popl %edx
-	popl %ecx
-	popl %eax
-	iret
-");
-#endif
-
 #endif

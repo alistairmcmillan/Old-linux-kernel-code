@@ -1,167 +1,98 @@
 #
-# Makefile for the linux kernel block device drivers.
+# Makefile for kernel/blk_drv/scsi
 #
 # Note! Dependencies are done automagically by 'make dep', which also
-# removes any old dependencies. DON'T put your own dependencies here
-# unless it's something special (ie not a .c file).
+# removes any old dependencies. DONT put your own dependencies here
+# unless its something special (ie not a .c file).
 #
 
-#DEBUG = -DDEBUG=0xffffffff -DDEBUG_NO_CMD
+SCSI_HOSTS := 0
+SCSI_OBJS :=
 
-.c.s:
-	$(CC) $(CFLAGS) $(DEBUG) -S $<
+ifdef CONFIG_SCSI
 
-.s.o:
-	$(AS) -c -o $*.o $<
+SCSI_OBJS := hosts.o scsi.o scsi_ioctl.o
 
-.c.o:
-	$(CC) $(CFLAGS) $(DEBUG) -c $<
+ifdef CONFIG_BLK_DEV_ST
+SCSI_OBJS := $(SCSI_OBJS) st.o
+endif
 
+ifdef CONFIG_BLK_DEV_SD
+SCSI_OBJS := $(SCSI_OBJS) sd.o sd_ioctl.o
+endif
 
-LOWLEVELSSRC = seagate2.s
-LOWLEVELCSRC = aha1542.c fdomain.c seagate.c ultrastor.c 7000fasst.c
-LOWLEVELHSRC = aha1542.h fdomain.h seagate.h ultrastor.h 7000fasst.o
- 
-CSRC = hosts.c sd.c sd_ioctl.c st.c st_ioctl.c scsi.c scsi_ioctl.c $(LOWLEVELCSRC)
-HSRC = hosts.h sd.h st.h scsi.h scsi_ioctl.h $(LOWLEVELHSRC)
+ifdef CONFIG_BLK_DEV_SR
+SCSI_OBJS := $(SCSI_OBJS) sr.o sr_ioctl.o
+endif
 
-OBJS =	scsi.o hosts.o scsi_ioctl.o sd.o sd_ioctl.o st.o st_ioctl.o \
-	aha1542.o fdomain.o seagate.o seagate2.o ultrastor.o 7000fasst.o
+ifdef CONFIG_SCSI_AHA1542
+SCSI_OBJS := $(SCSI_OBJS) aha1542.o
+SCSI_HOSTS := 1+$(SCSI_HOSTS)
+endif
 
-all: scsi.a
+ifdef CONFIG_SCSI_AHA1740
+SCSI_OBJS := $(SCSI_OBJS) aha1740.o
+SCSI_HOSTS := 1+$(SCSI_HOSTS)
+endif
 
-figure : hosts.h $(KERNELHDRS)/linux/config.h hosts.c 
-	$(HOSTCC) -N -DFIGURE_MAX_SCSI_HOSTS hosts.c -o figure
+ifdef CONFIG_SCSI_FUTURE_DOMAIN
+SCSI_OBJS := $(SCSI_OBJS) fdomain.o
+SCSI_HOSTS := 1+$(SCSI_HOSTS)
+endif
 
-max_hosts.h : figure
-	(echo "#ifndef _MAX_HOSTS_H"; \
-	 echo "#define _MAX_HOSTS_H"; \
-	 echo "#define MAX_SCSI_HOSTS `./figure`";\
-	 echo "#endif") > tmp_max
-	cp tmp_max max_hosts.h
-		
-scsi.a: $(OBJS)
-	$(AR) rcs scsi.a $(OBJS)
+ifdef CONFIG_SCSI_ULTRASTOR
+SCSI_OBJS := $(SCSI_OBJS) ultrastor.o
+SCSI_HOSTS := 1+$(SCSI_HOSTS)
+endif
+
+ifdef CONFIG_SCSI_7000FASST
+SCSI_OBJS := $(SCSI_OBJS) wd7000.o
+SCSI_HOSTS := 1+$(SCSI_HOSTS)
+endif
+
+ifdef CONFIG_SCSI_SEAGATE
+SCSI_OBJS := $(SCSI_OBJS) seagate.o
+SCSI_HOSTS := 1+$(SCSI_HOSTS)
+else
+ifdef CONFIG_SCSI_FD_88x
+SCSI_OBJS := $(SCSI_OBJS) seagate.o
+SCSI_HOSTS := 1+$(SCSI_HOSTS)
+endif
+endif
+
+ifdef CONFIG_SCSI_DEBUG
+SCSI_OBJS := $(SCSI_OBJS) scsi_debug.o
+SCSI_HOSTS := 1+$(SCSI_HOSTS)
+endif
+
+scsi.a: $(SCSI_OBJS)
+	rm -f scsi.a
+	$(AR) rcs scsi.a $(SCSI_OBJS)
 	sync
 
-clean:
-	rm -f core *.o *.a tmp_make tmp_max figure max_hosts.h
+else
 
-seagate2.o : seagate2.s
+scsi.a:
+	rm -f scsi.a
+	@echo No SCSI drivers configured
+	$(AR) rcs scsi.a
+
+endif
+
+CFLAGS := $(CFLAGS) "-DMAX_SCSI_HOSTS=($(SCSI_HOSTS))"
 
 seagate.o: seagate.c
-	$(CC) -Wall -c seagate.c 
+	$(CC) -Wall -I$(KERNELHDRS) -c seagate.c 
+
+clean:
+	rm -f core *.o *.a *.s
 
 dep:
-	touch max_hosts.h
-	sed '/\#\#\# Dependencies/q' < Makefile > tmp_make
-	for i in *.c;do $(CPP) -M $$i;done >> tmp_make
-	rm max_hosts.h
-	cp tmp_make Makefile
+	$(CPP) -M *.c > .depend
 
-### Dependencies:
-7000fasst.o : 7000fasst.c /usr/src/linux/include/linux/config.h /usr/src/linux/include/linux/config_rel.h \
-  /usr/src/linux/include/linux/config_ver.h /usr/src/linux/include/linux/config.dist.h \
-  /usr/src/linux/include/linux/kernel.h /usr/src/linux/include/linux/head.h /usr/src/linux/include/linux/types.h \
-  /usr/src/linux/include/linux/string.h /usr/src/linux/include/asm/system.h /usr/src/linux/include/asm/io.h \
-  scsi.h hosts.h max_hosts.h 7000fasst.h 
-aha1542.o : aha1542.c /usr/src/linux/include/linux/config.h /usr/src/linux/include/linux/config_rel.h \
-  /usr/src/linux/include/linux/config_ver.h /usr/src/linux/include/linux/config.dist.h \
-  /usr/src/linux/include/linux/kernel.h /usr/src/linux/include/linux/head.h /usr/src/linux/include/linux/types.h \
-  /usr/src/linux/include/linux/string.h /usr/src/linux/include/asm/system.h /usr/src/linux/include/asm/io.h \
-  scsi.h hosts.h max_hosts.h aha1542.h 
-fdomain.o : fdomain.c /usr/src/linux/include/linux/config.h /usr/src/linux/include/linux/config_rel.h \
-  /usr/src/linux/include/linux/config_ver.h /usr/src/linux/include/linux/config.dist.h \
-  /usr/src/linux/include/linux/sched.h /usr/src/linux/include/linux/head.h /usr/src/linux/include/linux/fs.h \
-  /usr/src/linux/include/linux/limits.h /usr/src/linux/include/linux/wait.h /usr/src/linux/include/linux/types.h \
-  /usr/src/linux/include/linux/dirent.h /usr/src/linux/include/linux/vfs.h /usr/src/linux/include/linux/minix_fs_sb.h \
-  /usr/src/linux/include/linux/ext_fs_sb.h /usr/src/linux/include/linux/msdos_fs_sb.h \
-  /usr/src/linux/include/linux/mm.h /usr/src/linux/include/linux/kernel.h /usr/src/linux/include/linux/signal.h \
-  /usr/src/linux/include/linux/time.h /usr/src/linux/include/linux/param.h /usr/src/linux/include/linux/resource.h \
-  /usr/src/linux/include/asm/io.h fdomain.h scsi.h hosts.h max_hosts.h /usr/src/linux/include/asm/system.h \
-  /usr/src/linux/include/linux/errno.h 
-hosts.o : hosts.c /usr/src/linux/include/linux/config.h /usr/src/linux/include/linux/config_rel.h \
-  /usr/src/linux/include/linux/config_ver.h /usr/src/linux/include/linux/config.dist.h \
-  /usr/src/linux/include/linux/kernel.h scsi.h hosts.h max_hosts.h aha1542.h /usr/src/linux/include/linux/types.h \
-  fdomain.h seagate.h ultrastor.h 7000fasst.h 
-scsi.o : scsi.c /usr/src/linux/include/linux/config.h /usr/src/linux/include/linux/config_rel.h \
-  /usr/src/linux/include/linux/config_ver.h /usr/src/linux/include/linux/config.dist.h \
-  /usr/src/linux/include/asm/system.h /usr/src/linux/include/linux/sched.h /usr/src/linux/include/linux/head.h \
-  /usr/src/linux/include/linux/fs.h /usr/src/linux/include/linux/limits.h /usr/src/linux/include/linux/wait.h \
-  /usr/src/linux/include/linux/types.h /usr/src/linux/include/linux/dirent.h /usr/src/linux/include/linux/vfs.h \
-  /usr/src/linux/include/linux/minix_fs_sb.h /usr/src/linux/include/linux/ext_fs_sb.h \
-  /usr/src/linux/include/linux/msdos_fs_sb.h /usr/src/linux/include/linux/mm.h \
-  /usr/src/linux/include/linux/kernel.h /usr/src/linux/include/linux/signal.h \
-  /usr/src/linux/include/linux/time.h /usr/src/linux/include/linux/param.h /usr/src/linux/include/linux/resource.h \
-  /usr/src/linux/include/linux/timer.h /usr/src/linux/include/linux/string.h scsi.h \
-  hosts.h max_hosts.h sd.h /usr/src/linux/include/linux/genhd.h st.h 
-scsi_ioctl.o : scsi_ioctl.c /usr/src/linux/include/linux/config.h /usr/src/linux/include/linux/config_rel.h \
-  /usr/src/linux/include/linux/config_ver.h /usr/src/linux/include/linux/config.dist.h \
-  /usr/src/linux/include/asm/io.h /usr/src/linux/include/asm/segment.h /usr/src/linux/include/asm/system.h \
-  /usr/src/linux/include/linux/errno.h /usr/src/linux/include/linux/kernel.h /usr/src/linux/include/linux/sched.h \
-  /usr/src/linux/include/linux/head.h /usr/src/linux/include/linux/fs.h /usr/src/linux/include/linux/limits.h \
-  /usr/src/linux/include/linux/wait.h /usr/src/linux/include/linux/types.h /usr/src/linux/include/linux/dirent.h \
-  /usr/src/linux/include/linux/vfs.h /usr/src/linux/include/linux/minix_fs_sb.h \
-  /usr/src/linux/include/linux/ext_fs_sb.h /usr/src/linux/include/linux/msdos_fs_sb.h \
-  /usr/src/linux/include/linux/mm.h /usr/src/linux/include/linux/signal.h /usr/src/linux/include/linux/time.h \
-  /usr/src/linux/include/linux/param.h /usr/src/linux/include/linux/resource.h \
-  /usr/src/linux/include/linux/string.h scsi.h hosts.h max_hosts.h scsi_ioctl.h 
-sd.o : sd.c /usr/src/linux/include/linux/config.h /usr/src/linux/include/linux/config_rel.h \
-  /usr/src/linux/include/linux/config_ver.h /usr/src/linux/include/linux/config.dist.h \
-  /usr/src/linux/include/linux/fs.h /usr/src/linux/include/linux/limits.h /usr/src/linux/include/linux/wait.h \
-  /usr/src/linux/include/linux/types.h /usr/src/linux/include/linux/dirent.h /usr/src/linux/include/linux/vfs.h \
-  /usr/src/linux/include/linux/minix_fs_sb.h /usr/src/linux/include/linux/ext_fs_sb.h \
-  /usr/src/linux/include/linux/msdos_fs_sb.h /usr/src/linux/include/linux/kernel.h \
-  /usr/src/linux/include/linux/sched.h /usr/src/linux/include/linux/head.h /usr/src/linux/include/linux/mm.h \
-  /usr/src/linux/include/linux/signal.h /usr/src/linux/include/linux/time.h /usr/src/linux/include/linux/param.h \
-  /usr/src/linux/include/linux/resource.h /usr/src/linux/include/linux/string.h \
-  scsi.h sd.h /usr/src/linux/include/linux/genhd.h ../blk.h 
-sd_ioctl.o : sd_ioctl.c /usr/src/linux/include/linux/config.h /usr/src/linux/include/linux/config_rel.h \
-  /usr/src/linux/include/linux/config_ver.h /usr/src/linux/include/linux/config.dist.h \
-  /usr/src/linux/include/linux/kernel.h /usr/src/linux/include/linux/sched.h /usr/src/linux/include/linux/head.h \
-  /usr/src/linux/include/linux/fs.h /usr/src/linux/include/linux/limits.h /usr/src/linux/include/linux/wait.h \
-  /usr/src/linux/include/linux/types.h /usr/src/linux/include/linux/dirent.h /usr/src/linux/include/linux/vfs.h \
-  /usr/src/linux/include/linux/minix_fs_sb.h /usr/src/linux/include/linux/ext_fs_sb.h \
-  /usr/src/linux/include/linux/msdos_fs_sb.h /usr/src/linux/include/linux/mm.h \
-  /usr/src/linux/include/linux/signal.h /usr/src/linux/include/linux/time.h /usr/src/linux/include/linux/param.h \
-  /usr/src/linux/include/linux/resource.h scsi.h sd.h /usr/src/linux/include/linux/genhd.h 
-seagate.o : seagate.c /usr/src/linux/include/linux/config.h /usr/src/linux/include/linux/config_rel.h \
-  /usr/src/linux/include/linux/config_ver.h /usr/src/linux/include/linux/config.dist.h \
-  /usr/src/linux/include/asm/io.h /usr/src/linux/include/asm/system.h /usr/src/linux/include/linux/sched.h \
-  /usr/src/linux/include/linux/head.h /usr/src/linux/include/linux/fs.h /usr/src/linux/include/linux/limits.h \
-  /usr/src/linux/include/linux/wait.h /usr/src/linux/include/linux/types.h /usr/src/linux/include/linux/dirent.h \
-  /usr/src/linux/include/linux/vfs.h /usr/src/linux/include/linux/minix_fs_sb.h \
-  /usr/src/linux/include/linux/ext_fs_sb.h /usr/src/linux/include/linux/msdos_fs_sb.h \
-  /usr/src/linux/include/linux/mm.h /usr/src/linux/include/linux/kernel.h /usr/src/linux/include/linux/signal.h \
-  /usr/src/linux/include/linux/time.h /usr/src/linux/include/linux/param.h /usr/src/linux/include/linux/resource.h \
-  seagate.h scsi.h hosts.h max_hosts.h 
-st.o : st.c /usr/src/linux/include/linux/config.h /usr/src/linux/include/linux/config_rel.h \
-  /usr/src/linux/include/linux/config_ver.h /usr/src/linux/include/linux/config.dist.h \
-  scsi.h st.h /usr/src/linux/include/linux/fs.h /usr/src/linux/include/linux/limits.h \
-  /usr/src/linux/include/linux/wait.h /usr/src/linux/include/linux/types.h /usr/src/linux/include/linux/dirent.h \
-  /usr/src/linux/include/linux/vfs.h /usr/src/linux/include/linux/minix_fs_sb.h \
-  /usr/src/linux/include/linux/ext_fs_sb.h /usr/src/linux/include/linux/msdos_fs_sb.h \
-  /usr/src/linux/include/linux/kernel.h /usr/src/linux/include/linux/sched.h /usr/src/linux/include/linux/head.h \
-  /usr/src/linux/include/linux/mm.h /usr/src/linux/include/linux/signal.h /usr/src/linux/include/linux/time.h \
-  /usr/src/linux/include/linux/param.h /usr/src/linux/include/linux/resource.h \
-  ../blk.h 
-st_ioctl.o : st_ioctl.c /usr/src/linux/include/linux/config.h /usr/src/linux/include/linux/config_rel.h \
-  /usr/src/linux/include/linux/config_ver.h /usr/src/linux/include/linux/config.dist.h \
-  /usr/src/linux/include/linux/kernel.h /usr/src/linux/include/linux/sched.h /usr/src/linux/include/linux/head.h \
-  /usr/src/linux/include/linux/fs.h /usr/src/linux/include/linux/limits.h /usr/src/linux/include/linux/wait.h \
-  /usr/src/linux/include/linux/types.h /usr/src/linux/include/linux/dirent.h /usr/src/linux/include/linux/vfs.h \
-  /usr/src/linux/include/linux/minix_fs_sb.h /usr/src/linux/include/linux/ext_fs_sb.h \
-  /usr/src/linux/include/linux/msdos_fs_sb.h /usr/src/linux/include/linux/mm.h \
-  /usr/src/linux/include/linux/signal.h /usr/src/linux/include/linux/time.h /usr/src/linux/include/linux/param.h \
-  /usr/src/linux/include/linux/resource.h st.h scsi.h 
-ultrastor.o : ultrastor.c /usr/src/linux/include/linux/config.h /usr/src/linux/include/linux/config_rel.h \
-  /usr/src/linux/include/linux/config_ver.h /usr/src/linux/include/linux/config.dist.h \
-  /usr/src/linux/include/linux/stddef.h /usr/src/linux/include/linux/string.h \
-  /usr/src/linux/include/linux/sched.h /usr/src/linux/include/linux/head.h /usr/src/linux/include/linux/fs.h \
-  /usr/src/linux/include/linux/limits.h /usr/src/linux/include/linux/wait.h /usr/src/linux/include/linux/types.h \
-  /usr/src/linux/include/linux/dirent.h /usr/src/linux/include/linux/vfs.h /usr/src/linux/include/linux/minix_fs_sb.h \
-  /usr/src/linux/include/linux/ext_fs_sb.h /usr/src/linux/include/linux/msdos_fs_sb.h \
-  /usr/src/linux/include/linux/mm.h /usr/src/linux/include/linux/kernel.h /usr/src/linux/include/linux/signal.h \
-  /usr/src/linux/include/linux/time.h /usr/src/linux/include/linux/param.h /usr/src/linux/include/linux/resource.h \
-  /usr/src/linux/include/asm/io.h /usr/src/linux/include/asm/system.h ultrastor.h \
-  scsi.h hosts.h max_hosts.h 
+#
+# include a dependency file if one exists
+#
+ifeq (.depend,$(wildcard .depend))
+include .depend
+endif

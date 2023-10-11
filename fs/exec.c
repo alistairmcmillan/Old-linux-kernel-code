@@ -77,11 +77,14 @@ int core_dump(long signr, struct pt_regs * regs)
 		return 0;
 	current->dumpable = 0;
 /* See if we have enough room to write the upage.  */
-	if(current->rlim[RLIMIT_CORE].rlim_cur < PAGE_SIZE/1024) return 0;
+	if (current->rlim[RLIMIT_CORE].rlim_cur < PAGE_SIZE)
+		return 0;
 	__asm__("mov %%fs,%0":"=r" (fs));
 	__asm__("mov %0,%%fs"::"r" ((unsigned short) 0x10));
-	if (open_namei("core",O_CREAT | O_WRONLY | O_TRUNC,0600,&inode))
+	if (open_namei("core",O_CREAT | O_WRONLY | O_TRUNC,0600,&inode,NULL)) {
+		inode = NULL;
 		goto end_coredump;
+	}
 	if (!S_ISREG(inode->i_mode))
 		goto end_coredump;
 	if (!inode->i_op || !inode->i_op->default_file_ops)
@@ -99,35 +102,44 @@ int core_dump(long signr, struct pt_regs * regs)
 	if (!file.f_op->write)
 		goto close_coredump;
 	has_dumped = 1;
-/* write and seek example: from kernel space */
-	__asm__("mov %0,%%fs"::"r" ((unsigned short) 0x10));
+/* changed the size calculations - should hopefully work better. lbt */
 	dump.magic = CMAGIC;
-	dump.u_tsize = current->end_code / PAGE_SIZE;
-	dump.u_dsize = (current->brk - current->end_code) / PAGE_SIZE;
-	dump.u_ssize =((current->start_stack +(PAGE_SIZE-1)) / PAGE_SIZE) -
-	  (regs->esp/ PAGE_SIZE);
+	dump.start_code = 0;
+	dump.start_stack = regs->esp & ~(PAGE_SIZE - 1);
+	dump.u_tsize = ((unsigned long) current->end_code) >> 12;
+	dump.u_dsize = ((unsigned long) (current->brk + (PAGE_SIZE-1))) >> 12;
+	dump.u_dsize -= dump.u_tsize;
+	dump.u_ssize = 0;
+	if (dump.start_stack < TASK_SIZE)
+		dump.u_ssize = ((unsigned long) (TASK_SIZE - dump.start_stack)) >> 12;
 /* If the size of the dump file exceeds the rlimit, then see what would happen
    if we wrote the stack, but not the data area.  */
-	if ((dump.u_dsize+dump.u_ssize+1) * PAGE_SIZE/1024 >
+	if ((dump.u_dsize+dump.u_ssize+1) * PAGE_SIZE >
 	    current->rlim[RLIMIT_CORE].rlim_cur)
 		dump.u_dsize = 0;
 /* Make sure we have enough room to write the stack and data areas. */
-	if ((dump.u_ssize+1) * PAGE_SIZE / 1024 >
+	if ((dump.u_ssize+1) * PAGE_SIZE >
 	    current->rlim[RLIMIT_CORE].rlim_cur)
 		dump.u_ssize = 0;
        	dump.u_comm = 0;
 	dump.u_ar0 = (struct pt_regs *)(((int)(&dump.regs)) -((int)(&dump)));
 	dump.signal = signr;
 	dump.regs = *regs;
-	dump.start_code = 0;
-	dump.start_stack = regs->esp & ~(PAGE_SIZE - 1);
-/* Flag indicating the math stuff is valid. */
-	if (dump.u_fpvalid = current->used_math) {
-		if (last_task_used_math == current)
-			__asm__("clts ; fnsave %0"::"m" (dump.i387));
-		else
-			memcpy(&dump.i387,&current->tss.i387,sizeof(dump.i387));
-	};
+/* Flag indicating the math stuff is valid. We don't support this for the
+   soft-float routines yet */
+	if (hard_math) {
+		if ((dump.u_fpvalid = current->used_math) != 0) {
+			if (last_task_used_math == current)
+				__asm__("clts ; fnsave %0"::"m" (dump.i387));
+			else
+				memcpy(&dump.i387,&current->tss.i387.hard,sizeof(dump.i387));
+		}
+	} else {
+		/* we should dump the emulator state here, but we need to
+		   convert it into standard 387 format first.. */
+		dump.u_fpvalid = 0;
+	}
+	__asm__("mov %0,%%fs"::"r" ((unsigned short) 0x10));
 	DUMP_WRITE(&dump,sizeof(dump));
 	DUMP_SEEK(sizeof(dump));
  /* Dump the task struct.  Not be used by gdb, but could be useful */
@@ -138,14 +150,14 @@ int core_dump(long signr, struct pt_regs * regs)
 	__asm__("mov %0,%%fs"::"r" ((unsigned short) 0x17));
 /* Dump the data area */
 	if (dump.u_dsize != 0) {
-		dump_start = current->end_code;
-		dump_size = current->brk - current->end_code;
+		dump_start = dump.u_tsize << 12;
+		dump_size = dump.u_dsize << 12;
 		DUMP_WRITE(dump_start,dump_size);
 	};
 /* Now prepare to dump the stack area */
 	if (dump.u_ssize != 0) {
-		dump_start = regs->esp & ~(PAGE_SIZE - 1);
-		dump_size = dump.u_ssize * PAGE_SIZE;
+		dump_start = dump.start_stack;
+		dump_size = dump.u_ssize << 12;
 		DUMP_WRITE(dump_start,dump_size);
 	};
 close_coredump:
@@ -169,17 +181,15 @@ int sys_uselib(const char * library)
 	struct inode * inode;
 	struct buffer_head * bh;
 	struct exec ex;
+	int error;
 
-	if (get_limit(0x17) != TASK_SIZE)
+	if (!library || get_limit(0x17) != TASK_SIZE)
 		return -EINVAL;
 	if ((libnum >= MAX_SHARED_LIBS) || (libnum < 0))
 		return -EINVAL;
-	if (library)
-		inode = namei(library);
-	else
-		inode = NULL;
-	if (!inode)
-		return -ENOENT;
+	error = namei(library,&inode);
+	if (error)
+		return error;
 	if (!inode->i_sb || !S_ISREG(inode->i_mode) || !permission(inode,MAY_READ)) {
 		iput(inode);
 		return -EACCES;
@@ -203,6 +213,7 @@ int sys_uselib(const char * library)
 	current->libraries[libnum].library = inode;
 	current->libraries[libnum].start = ex.a_entry;
 	current->libraries[libnum].length = (ex.a_data+ex.a_text+0xfff) & 0xfffff000;
+	current->libraries[libnum].bss = (ex.a_bss+0xfff) & 0xfffff000;
 #if 0
 	printk("Loaded library %d at %08x, length %08x\n",
 		libnum,
@@ -232,16 +243,19 @@ static unsigned long * create_tables(char * p,int argc,int envc)
 	put_fs_long((unsigned long)envp,--sp);
 	put_fs_long((unsigned long)argv,--sp);
 	put_fs_long((unsigned long)argc,--sp);
+	current->arg_start = (unsigned long) p;
 	while (argc-->0) {
 		put_fs_long((unsigned long) p,argv++);
 		while (get_fs_byte(p++)) /* nothing */ ;
 	}
 	put_fs_long(0,argv);
+	current->arg_end = current->env_start = (unsigned long) p;
 	while (envc-->0) {
 		put_fs_long((unsigned long) p,envp++);
 		while (get_fs_byte(p++)) /* nothing */ ;
 	}
 	put_fs_long(0,envp);
+	current->env_end = (unsigned long) p;
 	return sp;
 }
 
@@ -253,7 +267,7 @@ static int count(char ** argv)
 	int i=0;
 	char ** tmp;
 
-	if (tmp = argv)
+	if ((tmp = argv) != 0)
 		while (get_fs_long((unsigned long *) (tmp++)))
 			i++;
 
@@ -334,19 +348,19 @@ static unsigned long change_ldt(unsigned long text_size,unsigned long * page)
 
 	code_limit = TASK_SIZE;
 	data_limit = TASK_SIZE;
-	code_base = get_base(current->ldt[1]);
-	data_base = code_base;
+	code_base = data_base = 0;
+	current->start_code = code_base;
 	set_base(current->ldt[1],code_base);
 	set_limit(current->ldt[1],code_limit);
 	set_base(current->ldt[2],data_base);
 	set_limit(current->ldt[2],data_limit);
 /* make sure fs points to the NEW data segment */
 	__asm__("pushl $0x17\n\tpop %%fs"::);
-	data_base += data_limit - LIBRARY_SIZE;
+	data_base += data_limit;
 	for (i=MAX_ARG_PAGES-1 ; i>=0 ; i--) {
 		data_base -= PAGE_SIZE;
 		if (page[i])
-			put_dirty_page(page[i],data_base);
+			put_dirty_page(current,page[i],data_base);
 	}
 	return data_limit;
 }
@@ -405,8 +419,9 @@ int do_execve(unsigned long * eip,long tmp,char * filename,
 		panic("execve called from supervisor mode");
 	for (i=0 ; i<MAX_ARG_PAGES ; i++)	/* clear page-table */
 		page[i]=0;
-	if (!(inode=namei(filename)))		/* get executables inode */
-		return -ENOENT;
+	retval = namei(filename,&inode);	/* get executable inode */
+	if (retval)
+		return retval;
 	argc = count(argv);
 	envc = count(envp);
 	
@@ -415,7 +430,7 @@ restart_interp:
 		retval = -EACCES;
 		goto exec_error2;
 	}
-	if (IS_NOEXEC(inode)) { /* FS mustn't be mounted noexec */
+	if (IS_NOEXEC(inode)) {		/* FS mustn't be mounted noexec */
 		retval = -EPERM;
 		goto exec_error2;
 	}
@@ -469,7 +484,7 @@ restart_interp:
 		brelse(bh);
 		iput(inode);
 		buf[127] = '\0';
-		if (cp = strchr(buf, '\n')) {
+		if ((cp = strchr(buf, '\n')) != NULL) {
 			*cp = '\0';
 			for (cp = buf; (*cp == ' ') || (*cp == '\t'); cp++);
 		}
@@ -520,12 +535,10 @@ restart_interp:
 		 */
 		old_fs = get_fs();
 		set_fs(get_ds());
-		if (!(inode=namei(interp))) { /* get executables inode */
-			set_fs(old_fs);
-			retval = -ENOENT;
-			goto exec_error1;
-		}
+		retval = namei(interp,&inode);
 		set_fs(old_fs);
+		if (retval)
+			goto exec_error1;
 		goto restart_interp;
 	}
 	brelse(bh);
@@ -579,22 +592,21 @@ restart_interp:
 			current->sigaction[i].sa_handler = NULL;
 	}
 	for (i=0 ; i<NR_OPEN ; i++)
-		if ((current->close_on_exec>>i)&1)
+		if (FD_ISSET(i,&current->close_on_exec))
 			sys_close(i);
-	current->close_on_exec = 0;
-	free_page_tables(get_base(current->ldt[1]),get_limit(0x0f));
-	free_page_tables(get_base(current->ldt[2]),get_limit(0x17));
+	FD_ZERO(&current->close_on_exec);
+	clear_page_tables(current);
 	if (last_task_used_math == current)
 		last_task_used_math = NULL;
 	current->used_math = 0;
 	p += change_ldt(ex.a_text,page);
-	p -= LIBRARY_SIZE + MAX_ARG_PAGES*PAGE_SIZE;
+	p -= MAX_ARG_PAGES*PAGE_SIZE;
 	p = (unsigned long) create_tables((char *)p,argc,envc);
 	current->brk = ex.a_bss +
 		(current->end_data = ex.a_data +
 		(current->end_code = ex.a_text));
 	current->start_stack = p;
-	current->rss = (LIBRARY_OFFSET - p + PAGE_SIZE-1) / PAGE_SIZE;
+	current->rss = (TASK_SIZE - p + PAGE_SIZE-1) / PAGE_SIZE;
 	current->suid = current->euid = e_uid;
 	current->sgid = current->egid = e_gid;
 	if (N_MAGIC(ex) == OMAGIC)

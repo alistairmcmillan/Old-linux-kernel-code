@@ -88,7 +88,6 @@ static unsigned long get_long(struct task_struct * tsk,
 {
 	unsigned long page;
 
-	addr += tsk->start_code;
 repeat:
 	page = tsk->tss.cr3 + ((addr >> 20) & 0xffc);
 	page = *(unsigned long *) page;
@@ -117,13 +116,14 @@ static void put_long(struct task_struct * tsk, unsigned long addr,
 {
 	unsigned long page;
 
-	addr += tsk->start_code;
 repeat:
 	page = tsk->tss.cr3 + ((addr >> 20) & 0xffc);
 	page = *(unsigned long *) page;
 	if (page & PAGE_PRESENT) {
 		page &= 0xfffff000;
 		page += (addr >> 10) & 0xffc;
+/* we're bypassing pagetables, so we have to set the dirty bit ourselves */
+		*(unsigned long *) page |= PAGE_DIRTY;
 		page = *((unsigned long *) page);
 	}
 	if (!(page & PAGE_PRESENT)) {
@@ -306,9 +306,14 @@ int sys_ptrace(long request, long pid, long addr, long data)
 				return -EIO;
 			return 0;
 
+		case PTRACE_SYSCALL: /* continue and stop at next (return from) syscall */
 		case PTRACE_CONT: { /* restart after signal. */
 			long tmp;
 
+			if (request == PTRACE_SYSCALL)
+				child->flags |= PF_TRACESYS;
+			else
+				child->flags &= ~PF_TRACESYS;
 			child->signal = 0;
 			if (data > 0 && data <= NSIG)
 				child->signal = 1<<(data-1);
@@ -338,6 +343,7 @@ int sys_ptrace(long request, long pid, long addr, long data)
 		case PTRACE_SINGLESTEP: {  /* set the trap flag. */
 			long tmp;
 
+			child->flags &= ~PF_TRACESYS;
 			tmp = get_stack_long(child, 4*EFL-MAGICNUMBER) | TRAP_FLAG;
 			put_stack_long(child, 4*EFL-MAGICNUMBER,tmp);
 			child->state = TASK_RUNNING;
@@ -351,7 +357,7 @@ int sys_ptrace(long request, long pid, long addr, long data)
 		case PTRACE_DETACH: { /* detach a process that was attached. */
 			long tmp;
 
-			child->flags &= ~PF_PTRACED;
+			child->flags &= ~(PF_PTRACED|PF_TRACESYS);
 			child->signal=0;
 			child->state = 0;
 			REMOVE_LINKS(child);

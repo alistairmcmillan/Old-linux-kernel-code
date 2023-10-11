@@ -13,6 +13,7 @@
 
 #define TIMER_IRQ 0
 
+#include <linux/config.h>
 #include <linux/signal.h>
 #include <linux/sched.h>
 #include <linux/timer.h>
@@ -28,38 +29,13 @@
 #include <asm/segment.h>
 
 int need_resched = 0;
+int hard_math = 0;		/* set by boot/head.S */
+
+unsigned long * prof_buffer = NULL;
+unsigned long prof_len = 0;
 
 #define _S(nr) (1<<((nr)-1))
 #define _BLOCKABLE (~(_S(SIGKILL) | _S(SIGSTOP)))
-
-static void show_task(int nr,struct task_struct * p)
-{
-	int i,j = 4096-sizeof(struct task_struct);
-
-	printk("%d: pid=%d, state=%d, father=%d, child=%d, ",(p == current)?-nr:nr,p->pid,
-		p->state, p->p_pptr->pid, p->p_cptr ? p->p_cptr->pid : -1);
-	i=0;
-	while (i<j && !((char *)(p+1))[i])
-		i++;
-	printk("%d/%d chars free in kstack\n\r",i,j);
-	printk("   PC=%08X.", *(1019 + (unsigned long *) p));
-	if (p->p_ysptr || p->p_osptr) 
-		printk("   Younger sib=%d, older sib=%d\n\r", 
-			p->p_ysptr ? p->p_ysptr->pid : -1,
-			p->p_osptr ? p->p_osptr->pid : -1);
-	else
-		printk("\n\r");
-}
-
-void show_state(void)
-{
-	int i;
-
-	printk("\rTask-info:\n\r");
-	for (i=0 ; i<NR_TASKS ; i++)
-		if (task[i])
-			show_task(i,task[i]);
-}
 
 #define LATCH (1193180/HZ)
 
@@ -68,12 +44,8 @@ extern void mem_use(void);
 extern int timer_interrupt(void);
 extern int system_call(void);
 
-union task_union {
-	struct task_struct task;
-	char stack[PAGE_SIZE];
-};
-
-static union task_union init_task = {INIT_TASK, };
+static unsigned long init_kernel_stack[1024];
+static struct task_struct init_task = INIT_TASK;
 
 unsigned long volatile jiffies=0;
 unsigned long startup_time=0;
@@ -83,10 +55,10 @@ int jiffies_offset = 0;		/* # clock ticks to add to get "true
 				   who like to syncronize their machines
 				   to WWV :-) */
 
-struct task_struct *current = &(init_task.task);
+struct task_struct *current = &init_task;
 struct task_struct *last_task_used_math = NULL;
 
-struct task_struct * task[NR_TASKS] = {&(init_task.task), };
+struct task_struct * task[NR_TASKS] = {&init_task, };
 
 long user_stack [ PAGE_SIZE>>2 ] ;
 
@@ -132,17 +104,15 @@ void schedule(void)
 /* check alarm, wake up any interruptible tasks that have got a signal */
 
 	need_resched = 0;
-	for(p = &LAST_TASK ; p > &FIRST_TASK ; --p)
-		if (*p) {
-			if ((*p)->timeout && (*p)->timeout < jiffies)
-				if ((*p)->state == TASK_INTERRUPTIBLE) {
-					(*p)->timeout = 0;
-					wake_one_task(*p);
-				}
-			if (((*p)->signal & ~(*p)->blocked) &&
-			    (*p)->state==TASK_INTERRUPTIBLE)
-				wake_one_task(*p);
-		}
+	for(p = &LAST_TASK ; p > &FIRST_TASK ; --p) {
+		if (!*p || ((*p)->state != TASK_INTERRUPTIBLE))
+			continue;
+		if ((*p)->timeout && (*p)->timeout < jiffies) {
+			(*p)->timeout = 0;
+			(*p)->state = TASK_RUNNING;
+		} else if ((*p)->signal & ~(*p)->blocked)
+			(*p)->state = TASK_RUNNING;
+	}
 
 /* this is the scheduler proper: */
 
@@ -157,12 +127,14 @@ void schedule(void)
 			if ((*p)->state == TASK_RUNNING && (*p)->counter > c)
 				c = (*p)->counter, next = i;
 		}
-		if (c) break;
+		if (c)
+			break;
 		for(p = &LAST_TASK ; p > &FIRST_TASK ; --p)
 			if (*p)
 				(*p)->counter = ((*p)->counter >> 1) +
 						(*p)->priority;
 	}
+	sti();
 	switch_to(next);
 }
 
@@ -182,60 +154,83 @@ int sys_pause(void)
 	return -EINTR;
 }
 
-void wake_one_task(struct task_struct * p)
-{
-	p->state = TASK_RUNNING;
-	if (p->counter > current->counter)
-		need_resched = 1;
-}
-
 /*
  * wake_up doesn't wake up stopped processes - they have to be awakened
  * with signals or similar.
+ *
+ * Note that this doesn't need cli-sti pairs: interrupts may not change
+ * the wait-queue structures directly, but only call wake_up() to wake
+ * a process. The process itself must remove the queue once it has woken.
  */
 void wake_up(struct wait_queue **q)
 {
-	struct wait_queue *tmp, *next;
+	struct wait_queue *tmp;
 	struct task_struct * p;
-	unsigned long flags;
 
-	if (!q || !(next = *q))
+	if (!q || !(tmp = *q))
 		return;
-	__asm__ __volatile__("pushfl ; popl %0 ; cli":"=r" (flags));
 	do {
-		tmp = next;
-		next = tmp->next;
-		if (p = tmp->task) {
-			if (p->state == TASK_ZOMBIE)
-				printk("wake_up: TASK_ZOMBIE\n");
-			else if (p->state != TASK_STOPPED) {
+		if ((p = tmp->task) != NULL) {
+			if ((p->state == TASK_UNINTERRUPTIBLE) ||
+			    (p->state == TASK_INTERRUPTIBLE)) {
 				p->state = TASK_RUNNING;
 				if (p->counter > current->counter)
 					need_resched = 1;
 			}
 		}
-		tmp->next = NULL;
-	} while (next && next != *q);
-	__asm__ __volatile__("pushl %0 ; popfl"::"r" (flags));
+		if (!tmp->next) {
+			printk("wait_queue is bad (eip = %08x)\n",((unsigned long *) q)[-1]);
+			printk("        q = %08x\n",q);
+			printk("       *q = %08x\n",*q);
+			printk("      tmp = %08x\n",tmp);
+			break;
+		}
+		tmp = tmp->next;
+	} while (tmp != *q);
+}
+
+void wake_up_interruptible(struct wait_queue **q)
+{
+	struct wait_queue *tmp;
+	struct task_struct * p;
+
+	if (!q || !(tmp = *q))
+		return;
+	do {
+		if ((p = tmp->task) != NULL) {
+			if (p->state == TASK_INTERRUPTIBLE) {
+				p->state = TASK_RUNNING;
+				if (p->counter > current->counter)
+					need_resched = 1;
+			}
+		}
+		if (!tmp->next) {
+			printk("wait_queue is bad (eip = %08x)\n",((unsigned long *) q)[-1]);
+			printk("        q = %08x\n",q);
+			printk("       *q = %08x\n",*q);
+			printk("      tmp = %08x\n",tmp);
+			break;
+		}
+		tmp = tmp->next;
+	} while (tmp != *q);
 }
 
 static inline void __sleep_on(struct wait_queue **p, int state)
 {
 	unsigned long flags;
+	struct wait_queue wait = { current, NULL };
 
 	if (!p)
 		return;
 	if (current == task[0])
 		panic("task[0] trying to sleep");
-	if (current->wait.next)
-		printk("__sleep_on: wait->next exists\n");
-	__asm__ __volatile__("pushfl ; popl %0 ; cli":"=r" (flags));
 	current->state = state;
-	add_wait_queue(p,&current->wait);
+	add_wait_queue(p, &wait);
+	save_flags(flags);
 	sti();
 	schedule();
-	remove_wait_queue(p,&current->wait);
-	__asm__("pushl %0 ; popfl"::"r" (flags));
+	remove_wait_queue(p, &wait);
+	restore_flags(flags);
 }
 
 void interruptible_sleep_on(struct wait_queue **p)
@@ -351,36 +346,44 @@ void add_timer(long jiffies, void (*fn)(void))
 	sti();
 }
 
-#define	FSHIFT	11
-#define	FSCALE	(1<<FSHIFT)
-/*
- * Constants for averages over 1, 5, and 15 minutes
- * when sampling at 5 second intervals.
- */
-static unsigned long cexp[3] = {
-	1884,	/* 0.9200444146293232 * FSCALE,	 exp(-1/12) */
-	2014,	/* 0.9834714538216174 * FSCALE,	 exp(-1/60) */
-	2037,	/* 0.9944598480048967 * FSCALE,	 exp(-1/180) */
-};
-unsigned long averunnable[3] = { 0, };	/* fixed point numbers */
-
-void update_avg(void)
-{
-    	int i, n=0;
-	struct task_struct **p;
-
-	for(p = &LAST_TASK; p > &FIRST_TASK; --p)
-		if (*p && ((*p)->state == TASK_RUNNING || 
-			   (*p)->state == TASK_UNINTERRUPTIBLE))
-			++n;
-	
-	for (i = 0; i < 3; ++i)
-		averunnable[i] = (cexp[i] * averunnable[i] +
-			n * FSCALE * (FSCALE - cexp[i])) >> FSHIFT;
-}
-
 unsigned long timer_active = 0;
 struct timer_struct timer_table[32];
+
+/*
+ * Hmm.. Changed this, as the GNU make sources (load.c) seems to
+ * imply that avenrun[] is the standard name for this kind of thing.
+ * Nothing else seems to be standardized: the fractional size etc
+ * all seem to differ on different machines.
+ */
+unsigned long avenrun[3] = { 0,0,0 };
+
+/*
+ * Nr of active tasks - counted in fixed-point numbers
+ */
+static unsigned long count_active_tasks(void)
+{
+	struct task_struct **p;
+	unsigned long nr = 0;
+
+	for(p = &LAST_TASK; p > &FIRST_TASK; --p)
+		if (*p && (*p)->state == TASK_RUNNING)
+			nr += FIXED_1;
+	return nr;
+}
+
+static inline void calc_load(void)
+{
+	unsigned long active_tasks; /* fixed-point */
+	static int count = LOAD_FREQ;
+
+	if (count-- > 0)
+		return;
+	count = LOAD_FREQ;
+	active_tasks = count_active_tasks();
+	CALC_LOAD(avenrun[0], EXP_1, active_tasks);
+	CALC_LOAD(avenrun[1], EXP_5, active_tasks);
+	CALC_LOAD(avenrun[2], EXP_15, active_tasks);
+}
 
 /*
  * The int argument is really a (struct pt_regs *), in case the
@@ -388,29 +391,33 @@ struct timer_struct timer_table[32];
  * irq uses this to decide if it should update the user or system
  * times.
  */
-static void do_timer(int regs)
+static void do_timer(struct pt_regs * regs)
 {
 	unsigned long mask;
 	struct timer_struct *tp = timer_table+0;
 	struct task_struct ** task_p;
-	static int avg_cnt = 0;
 
 	jiffies++;
-	if (3 & ((struct pt_regs *) regs)->cs)
+	calc_load();
+	if ((VM_MASK & regs->eflags) || (3 & regs->cs)) {
 		current->utime++;
-	else {
-		current->stime++;
 		/* Update ITIMER_VIRT for current task if not in a system call */
 		if (current->it_virt_value && !(--current->it_virt_value)) {
 			current->it_virt_value = current->it_virt_incr;
 			send_sig(SIGVTALRM,current,1);
 		}
+	} else {
+		current->stime++;
+#ifdef CONFIG_PROFILE
+		if (prof_buffer && current != task[0]) {
+			unsigned long eip = regs->eip;
+			eip >>= 2;
+			if (eip < prof_len)
+				prof_buffer[eip]++;
+		}
+#endif
 	}
-	if (--avg_cnt < 0) {
-		avg_cnt = 500;
-		update_avg();
-	}
-	if ((--current->counter)<=0) {
+	if (current == task[0] || (--current->counter)<=0) {
 		current->counter=0;
 		need_resched = 1;
 	}
@@ -505,6 +512,41 @@ int sys_nice(long increment)
 	return 0;
 }
 
+static void show_task(int nr,struct task_struct * p)
+{
+	int i, j;
+	unsigned char * stack;
+
+	printk("%d: pid=%d, state=%d, father=%d, child=%d, ",(p == current)?-nr:nr,p->pid,
+		p->state, p->p_pptr->pid, p->p_cptr ? p->p_cptr->pid : -1);
+	i = 0;
+	j = 4096;
+	if (!(stack = (char *) p->kernel_stack_page)) {
+		stack = (char *) init_kernel_stack;
+		j = sizeof(init_kernel_stack);
+	}
+	while (i<j && !*(stack++))
+		i++;
+	printk("%d/%d chars free in kstack\n\r",i,j);
+	printk("   PC=%08X.", *(1019 + (unsigned long *) p));
+	if (p->p_ysptr || p->p_osptr) 
+		printk("   Younger sib=%d, older sib=%d\n\r", 
+			p->p_ysptr ? p->p_ysptr->pid : -1,
+			p->p_osptr ? p->p_osptr->pid : -1);
+	else
+		printk("\n\r");
+}
+
+void show_state(void)
+{
+	int i;
+
+	printk("\rTask-info:\n\r");
+	for (i=0 ; i<NR_TASKS ; i++)
+		if (task[i])
+			show_task(i,task[i]);
+}
+
 void sched_init(void)
 {
 	int i;
@@ -512,8 +554,8 @@ void sched_init(void)
 
 	if (sizeof(struct sigaction) != 16)
 		panic("Struct sigaction MUST be 16 bytes");
-	set_tss_desc(gdt+FIRST_TSS_ENTRY,&(init_task.task.tss));
-	set_ldt_desc(gdt+FIRST_LDT_ENTRY,&(init_task.task.ldt));
+	set_tss_desc(gdt+FIRST_TSS_ENTRY,&init_task.tss);
+	set_ldt_desc(gdt+FIRST_LDT_ENTRY,&init_task.ldt);
 	set_system_gate(0x80,&system_call);
 	p = gdt+2+FIRST_TSS_ENTRY;
 	for(i=1 ; i<NR_TASKS ; i++) {
@@ -525,10 +567,10 @@ void sched_init(void)
 	}
 /* Clear NT, so that we won't have troubles with that later on */
 	__asm__("pushfl ; andl $0xffffbfff,(%esp) ; popfl");
-	ltr(0);
-	lldt(0);
+	load_TR(0);
+	load_ldt(0);
 	outb_p(0x36,0x43);		/* binary, mode 3, LSB/MSB, ch 0 */
 	outb_p(LATCH & 0xff , 0x40);	/* LSB */
 	outb(LATCH >> 8 , 0x40);	/* MSB */
-	request_irq(TIMER_IRQ,do_timer);
+	request_irq(TIMER_IRQ,(void (*)(int)) do_timer);
 }

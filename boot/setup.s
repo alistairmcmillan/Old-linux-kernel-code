@@ -1,5 +1,5 @@
 !
-!	setup.s		Copyright (C) 1991, 1992 Linus Torvalds
+!	setup.S		Copyright (C) 1991, 1992 Linus Torvalds
 !
 ! setup.s is responsible for getting the system data from the BIOS,
 ! and putting them into the appropriate places in system memory.
@@ -11,10 +11,16 @@
 ! system to read them from there before the area is overwritten
 ! for buffer-blocks.
 !
+! Move PS/2 aux init code to psaux.c
+! (troyer@saifr00.cfsat.Honeywell.COM) 03Oct92
+!
 
 ! NOTE! These had better be the same as in bootsect.s!
 #include <linux/config.h>
-#define NORMAL_VGA 0xffff
+
+#ifndef SVGA_MODE
+#define SVGA_MODE ASK_VGA
+#endif
 
 INITSEG  = DEF_INITSEG	! we move boot here - out of the way
 SYSSEG   = DEF_SYSSEG	! system loaded at 0x10000 (65536).
@@ -61,6 +67,12 @@ start:
 	mov	ax,#0x5019
 	cmp	bl,#0x10
 	je	novga
+	mov	ax,#0x1a00	! Added check for EGA/VGA discrimination
+	int	0x10
+	mov	bx,ax
+	mov	ax,#0x5019
+	cmp	bl,#0x1a	! 1a means VGA, anything else EGA or lower
+	jne	novga	
 	call	chsvga
 novga:	mov	[14],ax
 	mov	ah,#0x03	! read cursor pos
@@ -119,6 +131,17 @@ no_disk1:
 	rep
 	stosb
 is_disk1:
+
+! check for PS/2 pointing device
+
+	mov	ax,#INITSEG
+	mov	ds,ax
+	mov	[0x1ff],#0	! default is no pointing device
+	int	0x11		! int 0x11: equipment determination
+	test	al,#0x04	! check if pointing device installed
+	jz	no_psmouse
+	mov	[0x1ff],#0xaa	! device present
+no_psmouse:
 
 ! now we want to move to protected mode ...
 
@@ -210,17 +233,25 @@ end_move:
 	jmpi	0,8		! jmp offset 0 of segment 8 (cs)
 
 ! This routine checks that the keyboard command queue is empty
+! (after emptying the output buffers)
+!
 ! No timeout is used - if this hangs there is something wrong with
 ! the machine, and we probably couldn't proceed anyway.
 empty_8042:
 	.word	0x00eb,0x00eb
 	in	al,#0x64	! 8042 status port
+	test	al,#1		! output buffer?
+	jz	no_output
+	.word	0x00eb,0x00eb
+	in	al,#0x60	! read it
+	jmp	empty_8042
+no_output:
 	test	al,#2		! is input buffer full?
 	jnz	empty_8042	! yes - loop
 	ret
 
 getkey:
-	in	al,#0x60	! Quick and dirty...
+	in	al,#0x60		! Quick and dirty...
 	.word	0x00eb,0x00eb		! jmp $+2, jmp $+2
 	mov	bl,al
 	in	al,#0x61
@@ -242,29 +273,50 @@ getkey:
 chsvga:	cld
 	push	ds
 	push	cs
+	mov	ax,[0x01fa]
 	pop	ds
+	mov	modesave,ax
 	mov 	ax,#0xc000
 	mov	es,ax
+	mov	ax,modesave
+	cmp	ax,#NORMAL_VGA
+	je	defvga
+	cmp	ax,#EXTENDED_VGA
+	je	extvga
+	cmp	ax,#ASK_VGA
+	jne	svga
 	lea	si,msg1
 	call	prtstr
-#ifndef SVGA_MODE
 flush:	in	al,#0x60		! Flush the keyboard buffer
 	cmp	al,#0x82
 	jb	nokey
 	jmp	flush
 nokey:	call getkey
-	cmp	al,#0x82
-	jb	nokey
-	cmp	al,#0xe0
-	ja	nokey
-	cmp	al,#0x9c
-	je	svga
-#endif
-#if !defined(SVGA_MODE) || SVGA_MODE == NORMAL_VGA
-	mov	ax,#0x5019
+	cmp	al,#0x9c		! enter ?
+	je	svga			! yes - svga selection
+	cmp	al,#0xb9		! space ?
+	jne	nokey			! no - repeat
+defvga:	mov	ax,#0x5019
 	pop	ds
 	ret
-#endif
+/* extended vga mode: 80x50 */
+extvga:
+	mov	ax,#0x1112
+	mov	bl,#0
+	int	0x10		! use 8x8 font set (50 lines on VGA)
+	mov	ax,#0x1200
+	mov	bl,#0x20
+	int	0x10		! use alternate print screen
+	mov	ax,#0x1201
+	mov	bl,#0x34
+	int	0x10		! turn off cursor emulation
+	mov	ah,#0x01
+	mov	cx,#0x0607
+	int	0x10		! turn on cursor (scan lines 6 to 7)
+	pop	ds
+	mov	ax,#0x5032	! return 80x50
+	ret
+/* svga modes */
 svga:	cld
 	lea 	si,idati		! Check ATI 'clues'
 	mov	di,#0x31
@@ -391,6 +443,17 @@ l1:	inc	si
 	lea	cx,selmod
 	jmp	cx
 nogen:	cld
+	lea	si,idoakvga
+	mov	di,#0x08
+	mov	cx,#0x08
+	repe
+	cmpsb
+	jne	nooak
+	lea	si,dscoakvga
+	lea	di,mooakvga
+	lea	cx,selmod
+	jmp	cx
+nooak:	cld
 	lea	si,idparadise		! Check Paradise 'clues'
 	mov	di,#0x7d
 	mov	cx,#0x04
@@ -503,9 +566,11 @@ tbl:	pop	bx
 	call	prtstr
 	pop	si
 	add	cl,#0x80
-#if defined(SVGA_MODE) && SVGA_MODE != NORMAL_VGA
-	mov	al,#SVGA_MODE		! Preset SVGA mode 
-#else
+	mov	ax,modesave
+	cmp	ax,#ASK_VGA
+	je	nonum
+	cmp	ax,#NORMAL_VGA
+	jne	gotmode
 nonum:	call	getkey
 	cmp	al,#0x82
 	jb	nonum
@@ -517,8 +582,7 @@ nonum:	call	getkey
 zero:	sub	al,#0x0a
 nozero:	sub	al,#0x80
 	dec	al
-#endif
-	xor	ah,ah
+gotmode:	xor	ah,ah
 	add	di,ax
 	inc	di
 	push	ax
@@ -531,25 +595,7 @@ nozero:	sub	al,#0x80
 	pop	ds
 	ret
 novid7:
-	mov	ax,#0x1112
-	mov	bl,#0
-	int	0x10		! use 8x8 font set (50 lines on VGA)
-
-	mov	ax,#0x1200
-	mov	bl,#0x20
-	int	0x10		! use alternate print screen
-
-	mov	ax,#0x1201
-	mov	bl,#0x34
-	int	0x10		! turn off cursor emulation
-
-	mov	ah,#0x01
-	mov	cx,#0x0607
-	int	0x10		! turn on cursor (scan lines 6 to 7)
-
-	pop	ds
-	mov	ax,#0x5032	! return 80x50
-	ret
+	br extvga
 
 ! Routine that 'tabs' to next col.
 
@@ -643,7 +689,7 @@ gdt_48:
 	.word	0x800		! gdt limit=2048, 256 GDT entries
 	.word	512+gdt,0x9	! gdt base = 0X9xxxx
 
-msg1:		.ascii	"Press <RETURN> to see SVGA-modes available or any other key to continue."
+msg1:		.ascii	"Press <RETURN> to see SVGA-modes available or <SPACE> to continue."
 		db	0x0d, 0x0a, 0x0a, 0x00
 msg2:		.ascii	"Mode:  COLSxROWS:"
 		db	0x0d, 0x0a, 0x0a, 0x00
@@ -654,6 +700,7 @@ idati:		.ascii	"761295520"
 idcandt:	.byte	0xa5
 idgenoa:	.byte	0x77, 0x00, 0x66, 0x99
 idparadise:	.ascii	"VGA="
+idoakvga:	.ascii  "OAK VGA "
 
 ! Manufacturer:	  Numofmodes:	Mode:
 
@@ -667,6 +714,7 @@ moparadise:	.byte	0x02,	0x55, 0x54
 motrident:	.byte	0x07,	0x50, 0x51, 0x52, 0x57, 0x58, 0x59, 0x5a
 motseng:	.byte	0x05,	0x26, 0x2a, 0x23, 0x24, 0x22
 movideo7:	.byte	0x06,	0x40, 0x43, 0x44, 0x41, 0x42, 0x45
+mooakvga:	.byte	0x05,	0x00, 0x07, 0x4f, 0x50, 0x51
 
 !			msb = Cols lsb = Rows:
 
@@ -680,6 +728,8 @@ dscparadise:	.word	0x8419, 0x842b
 dsctrident:	.word 	0x501e, 0x502b, 0x503c, 0x8419, 0x841e, 0x842b, 0x843c
 dsctseng:	.word	0x503c, 0x6428, 0x8419, 0x841c, 0x842c
 dscvideo7:	.word	0x502b, 0x503c, 0x643c, 0x8419, 0x842c, 0x841c
+dscoakvga:	.word	0x2819, 0x5019, 0x843c, 0x8419, 0x842C
+modesave:	.word	SVGA_MODE
 	
 .text
 endtext:

@@ -9,6 +9,17 @@
  * or rs-channels. It also implements echoing, cooked mode etc.
  *
  * Kill-line thanks to John T Kohl, who also corrected VMIN = VTIME = 0.
+ *
+ * Modified by Theodore Ts'o, 9/14/92, to dynamically allocate the
+ * tty_struct and tty_queue structures.  Previously there was a array
+ * of 256 tty_struct's which was statically allocated, and the
+ * tty_queue structures were allocated at boot time.  Both are now
+ * dynamically allocated only when the tty is open.
+ *
+ * Also restructured routines so that there is more of a separation
+ * between the high-level tty routines (tty_io.c and tty_ioctl.c) and
+ * the low-level tty routines (serial.c, pty.c, console.c).  This
+ * makes for cleaner and more compact code.  -TYT, 9/17/92 
  */
 
 #include <linux/types.h>
@@ -18,27 +29,20 @@
 #include <linux/sched.h>
 #include <linux/tty.h>
 #include <linux/ctype.h>
+#include <linux/kd.h>
+#include <linux/mm.h>
+#include <linux/string.h>
+#include <linux/keyboard.h>
 
-#include <asm/io.h>
 #include <asm/segment.h>
 #include <asm/system.h>
+#include <asm/bitops.h>
 
-#include <sys/kd.h>
 #include "vt_kern.h"
 
-#define QUEUES	(3*(NR_CONSOLES+NR_SERIALS+2*NR_PTYS))
-static struct tty_queue * tty_queues;
-struct tty_struct tty_table[256];
-
-#define con_queues tty_queues
-#define rs_queues ((3*NR_CONSOLES) + tty_queues)
-#define mpty_queues ((3*(NR_CONSOLES+NR_SERIALS)) + tty_queues)
-#define spty_queues ((3*(NR_CONSOLES+NR_SERIALS+NR_PTYS)) + tty_queues)
-
-#define con_table tty_table
-#define rs_table (64+tty_table)
-#define mpty_table (128+tty_table)
-#define spty_table (192+tty_table)
+struct tty_struct *tty_table[256];
+struct termios *tty_termios[256]; /* We need to keep the termios state */
+				  /* around, even when a tty is closed */
 
 /*
  * fg_console is the current virtual console,
@@ -47,14 +51,11 @@ struct tty_struct tty_table[256];
  */
 int fg_console = 0;
 struct tty_struct * redirect = NULL;
+struct wait_queue * keypress_wait = NULL;
 
-/*
- * these are the tables used by the machine code handlers.
- * you can implement virtual consoles.
- */
-struct tty_queue * table_list[] = { NULL, NULL };
+static int initialize_tty_struct(struct tty_struct *tty, int line);
 
-void inline put_tty_queue(char c, struct tty_queue * queue)
+void put_tty_queue(char c, struct tty_queue * queue)
 {
 	int head;
 	unsigned long flags;
@@ -68,7 +69,7 @@ void inline put_tty_queue(char c, struct tty_queue * queue)
 	__asm__ __volatile__("pushl %0 ; popfl"::"r" (flags));
 }
 
-int inline get_tty_queue(struct tty_queue * queue)
+int get_tty_queue(struct tty_queue * queue)
 {
 	int result = -1;
 	unsigned long flags;
@@ -82,9 +83,9 @@ int inline get_tty_queue(struct tty_queue * queue)
 	return result;
 }
 
-void inline tty_write_flush(struct tty_struct * tty)
+void tty_write_flush(struct tty_struct * tty)
 {
-	if (EMPTY(tty->write_q))
+	if (!tty->write || EMPTY(&tty->write_q))
 		return;
 	if (set_bit(TTY_WRITE_BUSY,&tty->flags))
 		return;
@@ -95,7 +96,7 @@ void inline tty_write_flush(struct tty_struct * tty)
 
 void tty_read_flush(struct tty_struct * tty)
 {
-	if (EMPTY(tty->read_q))
+	if (!tty || EMPTY(&tty->read_q))
 		return;
 	if (set_bit(TTY_READ_BUSY, &tty->flags))
 		return;
@@ -110,38 +111,39 @@ void change_console(unsigned int new_console)
 		return;
 	if (new_console == fg_console || new_console >= NR_CONSOLES)
 		return;
-	table_list[0] = con_queues + 0 + new_console*3;
-	table_list[1] = con_queues + 1 + new_console*3;
 	update_screen(new_console);
-}
-
-static void sleep_if_empty(struct tty_queue * queue)
-{
-	cli();
-	while (!(current->signal & ~current->blocked) && EMPTY(queue))
-		interruptible_sleep_on(&queue->proc_list);
-	sti();
 }
 
 void wait_for_keypress(void)
 {
-	sleep_if_empty(tty_table[fg_console].secondary);
-	flush_input(&tty_table[fg_console]);
+	interruptible_sleep_on(&keypress_wait);
 }
 
 void copy_to_cooked(struct tty_struct * tty)
 {
 	int c;
 
-	if (!(tty && tty->write && tty->read_q &&
-	    tty->write_q && tty->secondary)) {
-		printk("copy_to_cooked: missing queues\n\r");
+	if (!tty) {
+		printk("copy_to_cooked: called with NULL tty\n");
 		return;
 	}
+	if (!tty->write) {
+		printk("copy_to_cooked: tty %d has null write routine\n",
+		       tty->line);
+	}
 	while (1) {
-		if (FULL(tty->secondary))
+		/*
+		 * Check to see how much room we have left in the
+		 * secondary queue.  Send a throttle command or abort
+		 * if necessary.
+		 */
+		c = LEFT(&tty->secondary);
+		if (tty->throttle && (c < SQ_THRESHOLD_LW)
+		    && !set_bit(TTY_SQ_THROTTLED, &tty->flags))
+			tty->throttle(tty, TTY_THROTTLE_SQ_FULL);
+		if (c == 0)
 			break;
-		c = get_tty_queue(tty->read_q);
+		c = get_tty_queue(&tty->read_q);
 		if (c < 0)
 			break;
 		if (I_STRP(tty))
@@ -159,53 +161,58 @@ void copy_to_cooked(struct tty_struct * tty)
 			if ((KILL_CHAR(tty) != __DISABLED_CHAR) &&
 			    (c==KILL_CHAR(tty))) {
 				/* deal with killing the input line */
-				while(!(EMPTY(tty->secondary) ||
-					(c=LAST(tty->secondary))==10 ||
+				while(!(EMPTY(&tty->secondary) ||
+					(c=LAST(&tty->secondary))==10 ||
 					((EOF_CHAR(tty) != __DISABLED_CHAR) &&
 					 (c==EOF_CHAR(tty))))) {
 					if (L_ECHO(tty)) {
 						if (c<32) {
-							put_tty_queue(8,tty->write_q);
-							put_tty_queue(' ',tty->write_q);
-							put_tty_queue(8,tty->write_q);
+							put_tty_queue(8, &tty->write_q);
+							put_tty_queue(' ', &tty->write_q);
+							put_tty_queue(8,&tty->write_q);
 						}
-						put_tty_queue(8,tty->write_q);
-						put_tty_queue(' ',tty->write_q);
-						put_tty_queue(8,tty->write_q);
+						put_tty_queue(8,&tty->write_q);
+						put_tty_queue(' ',&tty->write_q);
+						put_tty_queue(8,&tty->write_q);
 					}
-					DEC(tty->secondary->head);
+					DEC(tty->secondary.head);
 				}
 				continue;
 			}
 			if ((ERASE_CHAR(tty) != __DISABLED_CHAR) &&
 			    (c==ERASE_CHAR(tty))) {
-				if (EMPTY(tty->secondary) ||
-				   (c=LAST(tty->secondary))==10 ||
+				if (EMPTY(&tty->secondary) ||
+				   (c=LAST(&tty->secondary))==10 ||
 				   ((EOF_CHAR(tty) != __DISABLED_CHAR) &&
 				    (c==EOF_CHAR(tty))))
 					continue;
 				if (L_ECHO(tty)) {
 					if (c<32) {
-						put_tty_queue(8,tty->write_q);
-						put_tty_queue(' ',tty->write_q);
-						put_tty_queue(8,tty->write_q);
+						put_tty_queue(8,&tty->write_q);
+						put_tty_queue(' ',&tty->write_q);
+						put_tty_queue(8,&tty->write_q);
 					}
-					put_tty_queue(8,tty->write_q);
-					put_tty_queue(32,tty->write_q);
-					put_tty_queue(8,tty->write_q);
+					put_tty_queue(8,&tty->write_q);
+					put_tty_queue(32,&tty->write_q);
+					put_tty_queue(8,&tty->write_q);
 				}
-				DEC(tty->secondary->head);
+				DEC(tty->secondary.head);
 				continue;
 			}
 		}
 		if (I_IXON(tty)) {
 			if ((STOP_CHAR(tty) != __DISABLED_CHAR) &&
 			    (c==STOP_CHAR(tty))) {
+			        tty->status_changed = 1;
+				tty->ctrl_status |= TIOCPKT_STOP;
 				tty->stopped=1;
 				continue;
 			}
-			if ((START_CHAR(tty) != __DISABLED_CHAR) &&
-			    (c==START_CHAR(tty))) {
+			if (((I_IXANY(tty)) && tty->stopped) ||
+			    ((START_CHAR(tty) != __DISABLED_CHAR) &&
+			     (c==START_CHAR(tty)))) {
+			        tty->status_changed = 1;
+				tty->ctrl_status |= TIOCPKT_START;
 				tty->stopped=0;
 				continue;
 			}
@@ -232,24 +239,30 @@ void copy_to_cooked(struct tty_struct * tty)
 		}
 		if (c==10 || (EOF_CHAR(tty) != __DISABLED_CHAR &&
 		    c==EOF_CHAR(tty)))
-			tty->secondary->data++;
+			tty->secondary.data++;
 		if ((c==10) && (L_ECHO(tty) || (L_CANON(tty) && L_ECHONL(tty)))) {
-			put_tty_queue(10,tty->write_q);
-			put_tty_queue(13,tty->write_q);
+			put_tty_queue(10,&tty->write_q);
+			put_tty_queue(13,&tty->write_q);
 		} else if (L_ECHO(tty)) {
 			if (c<32 && L_ECHOCTL(tty)) {
-				put_tty_queue('^',tty->write_q);
-				put_tty_queue(c+64,tty->write_q);
+				put_tty_queue('^',&tty->write_q);
+				put_tty_queue(c+64, &tty->write_q);
 			} else
-				put_tty_queue(c,tty->write_q);
+				put_tty_queue(c, &tty->write_q);
 		}
-		put_tty_queue(c,tty->secondary);
+		put_tty_queue(c, &tty->secondary);
 	}
 	TTY_WRITE_FLUSH(tty);
-	if (!EMPTY(tty->secondary))
-		wake_up(&tty->secondary->proc_list);
-	if (tty->write_q->proc_list && LEFT(tty->write_q) > TTY_BUF_SIZE/2)
-		wake_up(&tty->write_q->proc_list);
+	if (!EMPTY(&tty->secondary))
+		wake_up_interruptible(&tty->secondary.proc_list);
+	if (tty->write_q.proc_list && LEFT(&tty->write_q) > TTY_BUF_SIZE/2)
+		wake_up_interruptible(&tty->write_q.proc_list);
+	if (tty->throttle && (LEFT(&tty->read_q) >= RQ_THRESHOLD_HW)
+	    && !clear_bit(TTY_RQ_THROTTLED, &tty->flags))
+		tty->throttle(tty, TTY_THROTTLE_RQ_AVAIL);
+	if (tty->throttle && (LEFT(&tty->secondary) >= SQ_THRESHOLD_HW)
+	    && !clear_bit(TTY_SQ_THROTTLED, &tty->flags))
+		tty->throttle(tty, TTY_THROTTLE_SQ_AVAIL);
 }
 
 int is_ignored(int sig)
@@ -258,73 +271,30 @@ int is_ignored(int sig)
 	        (current->sigaction[sig-1].sa_handler == SIG_IGN));
 }
 
-/*
- * Called when we need to send a SIGTTIN or SIGTTOU to our process
- * group
- * 
- * We only request that a system call be restarted if there was if the 
- * default signal handler is being used.  The reason for this is that if
- * a job is catching SIGTTIN or SIGTTOU, the signal handler may not want 
- * the system call to be restarted blindly.  If there is no way to reset the
- * terminal pgrp back to the current pgrp (perhaps because the controlling
- * tty has been released on logout), we don't want to be in an infinite loop
- * while restarting the system call, and have it always generate a SIGTTIN
- * or SIGTTOU.  The default signal handler will cause the process to stop
- * thus avoiding the infinite loop problem.  Presumably the job-control
- * cognizant parent will fix things up before continuging its child process.
- */
-int tty_signal(int sig, struct tty_struct *tty)
-{
-	(void) kill_pg(current->pgrp,sig,1);
-	return -ERESTARTSYS;
-}
+static int available_canon_input(struct tty_struct *);
+static void __wait_for_canon_input(struct tty_struct *);
 
 static void wait_for_canon_input(struct tty_struct * tty)
 {
-	while (1) {
-		TTY_READ_FLUSH(tty);
-		if (tty->link)
-			if (tty->link->count)
-				TTY_WRITE_FLUSH(tty->link);
-			else
-				return;
+	if (!available_canon_input(tty)) {
 		if (current->signal & ~current->blocked)
 			return;
-		if (FULL(tty->read_q))
-			return;
-		if (tty->secondary->data)
-			return;
-		cli();
-		if (!tty->secondary->data)
-			interruptible_sleep_on(&tty->secondary->proc_list);
-		sti();
+		__wait_for_canon_input(tty);
 	}
 }
 
-static int read_chan(unsigned int channel, struct file * file, char * buf, int nr)
+static int read_chan(struct tty_struct * tty, struct file * file, char * buf, int nr)
 {
-	struct tty_struct * tty;
+	struct wait_queue wait = { current, NULL };
 	int c;
 	char * b=buf;
 	int minimum,time;
 
-	if (channel > 255)
-		return -EIO;
-	tty = TTY_TABLE(channel);
-	if (!(tty->read_q && tty->secondary))
-		return -EIO;
-	if ((tty->pgrp > 0) &&
-	    (current->tty == channel) &&
-	    (tty->pgrp != current->pgrp))
-		if (is_ignored(SIGTTIN) || is_orphaned_pgrp(current->pgrp))
-			return -EIO;
-		else
-			return(tty_signal(SIGTTIN, tty));
 	if (L_CANON(tty))
 		minimum = time = current->timeout = 0;
 	else {
-		time = 10L*tty->termios.c_cc[VTIME];
-		minimum = tty->termios.c_cc[VMIN];
+		time = 10L*tty->termios->c_cc[VTIME];
+		minimum = tty->termios->c_cc[VMIN];
 		if (minimum)
 			current->timeout = 0xffffffff;
 		else {
@@ -336,20 +306,45 @@ static int read_chan(unsigned int channel, struct file * file, char * buf, int n
 			minimum = 1;
 		}
 	}
-	if (file->f_flags & O_NONBLOCK)
+	if (file->f_flags & O_NONBLOCK) {
 		time = current->timeout = 0;
-	else if (L_CANON(tty))
+		if (L_CANON(tty)) {
+			if (!available_canon_input(tty))
+				return -EAGAIN;
+		}
+	} else if (L_CANON(tty)) {
 		wait_for_canon_input(tty);
+		if (current->signal & ~current->blocked)
+			return -ERESTARTSYS;
+	}
 	if (minimum>nr)
 		minimum = nr;
+
+	/* deal with packet mode:  First test for status change */
+	if (tty->packet && tty->link && tty->link->status_changed) {
+		put_fs_byte (tty->link->ctrl_status, b);
+		tty->link->status_changed = 0;
+		return 1;
+	}
+	  
+	/* now bump the buffer up one. */
+	if (tty->packet) {
+		put_fs_byte (0,b++);
+		nr--;
+		/* this really shouldn't happen, but we need to 
+		put it here. */
+		if (nr == 0)
+			return 1;
+	}
+	add_wait_queue(&tty->secondary.proc_list, &wait);
 	while (nr>0) {
 		TTY_READ_FLUSH(tty);
 		if (tty->link)
 			TTY_WRITE_FLUSH(tty->link);
-		while (nr > 0 && ((c = get_tty_queue(tty->secondary)) >= 0)) {
+		while (nr > 0 && ((c = get_tty_queue(&tty->secondary)) >= 0)) {
 			if ((EOF_CHAR(tty) != __DISABLED_CHAR &&
 			     c==EOF_CHAR(tty)) || c==10)
-				tty->secondary->data--;
+				tty->secondary.data--;
 			if ((EOF_CHAR(tty) != __DISABLED_CHAR &&
 			     c==EOF_CHAR(tty)) && L_CANON(tty))
 				break;
@@ -360,7 +355,14 @@ static int read_chan(unsigned int channel, struct file * file, char * buf, int n
 			if (c==10 && L_CANON(tty))
 				break;
 		};
-		wake_up(&tty->read_q->proc_list);
+		wake_up_interruptible(&tty->read_q.proc_list);
+		/*
+		 * If there is enough space in the secondary queue
+		 * now, let the low-level driver know.
+		 */
+		if (tty->throttle && (LEFT(&tty->secondary) >= SQ_THRESHOLD_HW)
+		    && !clear_bit(TTY_SQ_THROTTLED, &tty->flags))
+			tty->throttle(tty, TTY_THROTTLE_SQ_AVAIL);
 		if (b-buf >= minimum || !current->timeout)
 			break;
 		if (current->signal & ~current->blocked) 
@@ -370,17 +372,29 @@ static int read_chan(unsigned int channel, struct file * file, char * buf, int n
 		TTY_READ_FLUSH(tty);
 		if (tty->link)
 			TTY_WRITE_FLUSH(tty->link);
-		cli();
-		if (EMPTY(tty->secondary))
-			interruptible_sleep_on(&tty->secondary->proc_list);
-		sti();
+		if (!EMPTY(&tty->secondary))
+			continue;
+		current->state = TASK_INTERRUPTIBLE;
+		if (EMPTY(&tty->secondary))
+			schedule();
+		current->state = TASK_RUNNING;
 	}
+	remove_wait_queue(&tty->secondary.proc_list, &wait);
 	TTY_READ_FLUSH(tty);
 	if (tty->link && tty->link->write)
 		TTY_WRITE_FLUSH(tty->link);
 	current->timeout = 0;
-	if (b-buf)
-		return b-buf;
+
+	/* packet mode sticks in an extra 0.  If that's all we've got,
+	   we should count it a zero bytes. */
+	if (tty->packet) {
+		if ((b-buf) > 1)
+			return b-buf;
+	} else {
+		if (b-buf)
+			return b-buf;
+	}
+
 	if (current->signal & ~current->blocked)
 		return -ERESTARTSYS;
 	if (file->f_flags & O_NONBLOCK)
@@ -388,29 +402,48 @@ static int read_chan(unsigned int channel, struct file * file, char * buf, int n
 	return 0;
 }
 
-static int write_chan(unsigned int channel, struct file * file, char * buf, int nr)
+static void __wait_for_canon_input(struct tty_struct * tty)
 {
-	struct tty_struct * tty;
+	struct wait_queue wait = { current, NULL };
+
+	add_wait_queue(&tty->secondary.proc_list, &wait);
+	while (1) {
+		current->state = TASK_INTERRUPTIBLE;
+		if (available_canon_input(tty))
+			break;
+		if (current->signal & ~current->blocked)
+			break;
+		schedule();
+	}
+	current->state = TASK_RUNNING;
+	remove_wait_queue(&tty->secondary.proc_list, &wait);
+}
+
+static int available_canon_input(struct tty_struct * tty)
+{
+	TTY_READ_FLUSH(tty);
+	if (tty->link)
+		if (tty->link->count)
+			TTY_WRITE_FLUSH(tty->link);
+		else
+			return 1;
+	if (FULL(&tty->read_q))
+		return 1;
+	if (tty->secondary.data)
+		return 1;
+	return 0;
+}
+
+static int write_chan(struct tty_struct * tty, struct file * file, char * buf, int nr)
+{
+	struct wait_queue wait = { current, NULL };
 	char c, *b=buf;
 
-	if (channel > 255)
-		return -EIO;
-	tty = TTY_TABLE(channel);
-	if (L_TOSTOP(tty) && (tty->pgrp > 0) &&
-	    (current->tty == channel) && (tty->pgrp != current->pgrp)) {
-		if (is_orphaned_pgrp(tty->pgrp))
-			return -EIO;
-		if (!is_ignored(SIGTTOU))
-			return tty_signal(SIGTTOU, tty);
-	}
 	if (nr < 0)
 		return -EINVAL;
 	if (!nr)
 		return 0;
-	if (redirect && tty == TTY_TABLE(0))
-		tty = redirect;
-	if (!(tty->write_q && tty->write))
-		return -EIO;
+	add_wait_queue(&tty->write_q.proc_list, &wait);
 	while (nr>0) {
 		if (current->signal & ~current->blocked)
 			break;
@@ -418,15 +451,16 @@ static int write_chan(unsigned int channel, struct file * file, char * buf, int 
 			send_sig(SIGPIPE,current,0);
 			break;
 		}
-		if (FULL(tty->write_q)) {
+		current->state = TASK_INTERRUPTIBLE;
+		if (FULL(&tty->write_q)) {
 			TTY_WRITE_FLUSH(tty);
-			cli();
-			if (FULL(tty->write_q))
-				interruptible_sleep_on(&tty->write_q->proc_list);
-			sti();
+			if (FULL(&tty->write_q))
+				schedule();
+			current->state = TASK_RUNNING;
 			continue;
 		}
-		while (nr>0 && !FULL(tty->write_q)) {
+		current->state = TASK_RUNNING;
+		while (nr>0 && !FULL(&tty->write_q)) {
 			c=get_fs_byte(b);
 			if (O_POST(tty)) {
 				if (c=='\r' && O_CRNL(tty))
@@ -435,7 +469,7 @@ static int write_chan(unsigned int channel, struct file * file, char * buf, int 
 					c='\r';
 				if (c=='\n' && O_NLCR(tty) &&
 				    !set_bit(TTY_CR_PENDING,&tty->flags)) {
-					put_tty_queue(13,tty->write_q);
+					put_tty_queue(13,&tty->write_q);
 					continue;
 				}
 				if (O_LCUC(tty))
@@ -443,11 +477,12 @@ static int write_chan(unsigned int channel, struct file * file, char * buf, int 
 			}
 			b++; nr--;
 			clear_bit(TTY_CR_PENDING,&tty->flags);
-			put_tty_queue(c,tty->write_q);
+			put_tty_queue(c,&tty->write_q);
 		}
-		if (nr>0)
+		if (need_resched)
 			schedule();
 	}
+	remove_wait_queue(&tty->write_q.proc_list, &wait);
 	TTY_WRITE_FLUSH(tty);
 	if (b-buf)
 		return b-buf;
@@ -460,13 +495,28 @@ static int write_chan(unsigned int channel, struct file * file, char * buf, int 
 
 static int tty_read(struct inode * inode, struct file * file, char * buf, int count)
 {
-	int i;
+	int i, dev;
+	struct tty_struct * tty;
 
-	if (MAJOR(file->f_rdev) != 4) {
+	dev = file->f_rdev;
+	if (MAJOR(dev) != 4) {
 		printk("tty_read: pseudo-major != 4\n");
 		return -EINVAL;
 	}
-	i = read_chan(MINOR(file->f_rdev),file,buf,count);
+	dev = MINOR(dev);
+	tty = TTY_TABLE(dev);
+	if (!tty)
+		return -EIO;
+	if (MINOR(inode->i_rdev) && (tty->pgrp > 0) &&
+	    (current->tty == dev) &&
+	    (tty->pgrp != current->pgrp))
+		if (is_ignored(SIGTTIN) || is_orphaned_pgrp(current->pgrp))
+			return -EIO;
+		else {
+			(void) kill_pg(current->pgrp, SIGTTIN, 1);
+			return -ERESTARTSYS;
+		}
+	i = read_chan(tty,file,buf,count);
 	if (i > 0)
 		inode->i_atime = CURRENT_TIME;
 	return i;
@@ -474,13 +524,32 @@ static int tty_read(struct inode * inode, struct file * file, char * buf, int co
 
 static int tty_write(struct inode * inode, struct file * file, char * buf, int count)
 {
-	int i;
-	
-	if (MAJOR(file->f_rdev) != 4) {
+	int dev,i;
+	struct tty_struct * tty;
+
+	dev = file->f_rdev;
+	if (MAJOR(dev) != 4) {
 		printk("tty_write: pseudo-major != 4\n");
 		return -EINVAL;
 	}
-	i = write_chan(MINOR(file->f_rdev),file,buf,count);
+	dev = MINOR(dev);
+	if (redirect && ((dev == 0) || (dev == fg_console+1)))
+		tty = redirect;
+	else
+		tty = TTY_TABLE(dev);
+	if (!tty || !tty->write)
+		return -EIO;
+	if (MINOR(inode->i_rdev) &&
+	    L_TOSTOP(tty) && (tty->pgrp > 0) &&
+	    (current->tty == dev) && (tty->pgrp != current->pgrp)) {
+		if (is_orphaned_pgrp(tty->pgrp))
+			return -EIO;
+		if (!is_ignored(SIGTTOU)) {
+			(void) kill_pg(current->pgrp, SIGTTOU, 1);
+			return -ERESTARTSYS;
+		}
+	}
+	i = write_chan(tty,file,buf,count);
 	if (i > 0)
 		inode->i_mtime = CURRENT_TIME;
 	return i;
@@ -498,10 +567,13 @@ static int tty_lseek(struct inode * inode, struct file * file, off_t offset, int
  *
  * Open-counting is needed for pty masters, as well as for keeping
  * track of serial lines: DTR is dropped when the last close happens.
+ *
+ * The termios state of a pty is reset on first open so that
+ * settings don't persist across reuse.
  */
 static int tty_open(struct inode * inode, struct file * filp)
 {
-	struct tty_struct *tty;
+	struct tty_struct *tty, *o_tty;
 	int dev, retval;
 
 	dev = inode->i_rdev;
@@ -510,22 +582,80 @@ static int tty_open(struct inode * inode, struct file * filp)
 	else
 		dev = MINOR(dev);
 	if (dev < 0)
-		return -ENODEV;
+		return -ENXIO;
+	if (!dev)
+		dev = fg_console + 1;
 	filp->f_rdev = 0x0400 | dev;
-	tty = TTY_TABLE(dev);
-	if (!tty->count && !(tty->link && tty->link->count)) {
-		flush_input(tty);
-		flush_output(tty);
-		tty->stopped = 0;
+/*
+ * There be race-conditions here... Lots of them. Careful now.
+ */
+	tty = o_tty = NULL;
+	tty = tty_table[dev];
+	if (!tty) {
+		tty = (struct tty_struct *) get_free_page(GFP_KERNEL);
+		if (tty_table[dev]) {
+			/*
+			 * Stop our allocation of tty if race
+			 * condition detected.
+			 */
+			if (tty)
+				free_page((unsigned long) tty);
+			tty = tty_table[dev];
+		} else {
+			if (!tty)
+				return -ENOMEM;
+			retval = initialize_tty_struct(tty, dev);
+			if (retval) {
+				free_page((unsigned long) tty);
+				return retval;
+			}
+			tty_table[dev] = tty;
+		}
+	}
+	tty->count++;			/* bump count to preserve tty */
+	if (IS_A_PTY(dev)) {
+		o_tty = tty_table[PTY_OTHER(dev)];
+		if (!o_tty) {
+			o_tty = (struct tty_struct *) get_free_page(GFP_KERNEL);
+			if (tty_table[PTY_OTHER(dev)]) {
+				/*
+				 * Stop our allocation of o_tty if race
+				 * condition detected.
+				 */
+				free_page((unsigned long) o_tty);
+				o_tty = tty_table[PTY_OTHER(dev)];
+			} else {
+				if (!o_tty) {
+					tty->count--;
+					return -ENOMEM;
+				}
+				retval = initialize_tty_struct(o_tty, PTY_OTHER(dev));
+				if (retval) {
+					tty->count--;
+					free_page((unsigned long) o_tty);
+					return retval;
+				}
+				tty_table[PTY_OTHER(dev)] = o_tty;
+			}
+		}
+		tty->link = o_tty;				
+		o_tty->link = tty;
 	}
 	if (IS_A_PTY_MASTER(dev)) {
-		if (tty->count)
+		if (tty->count > 1) {
+			tty->count--;
 			return -EAGAIN;
+		}
 		if (tty->link)
 			tty->link->count++;
-	}
-	tty->count++;
+	} 
 	retval = 0;
+
+	/* clean up the packet stuff. */
+	tty->status_changed = 0;
+	tty->ctrl_status = 0;
+	tty->packet = 0;
+
 	if (!(filp->f_flags & O_NOCTTY) &&
 	    current->leader &&
 	    current->tty<0 &&
@@ -534,10 +664,10 @@ static int tty_open(struct inode * inode, struct file * filp)
 		tty->session = current->session;
 		tty->pgrp = current->pgrp;
 	}
-	if (IS_A_SERIAL(dev) && tty->count < 2)
-		retval = serial_open(dev-64,filp);
-	else if (IS_A_PTY(dev))
-		retval = pty_open(dev,filp);
+	if (tty->open)
+		retval = tty->open(tty, filp);
+	else
+		retval = -ENODEV;
 	if (retval) {
 		tty->count--;
 		if (IS_A_PTY_MASTER(dev) && tty->link)
@@ -555,29 +685,76 @@ static void tty_release(struct inode * inode, struct file * filp)
 {
 	int dev;
 	struct tty_struct * tty;
+	unsigned long free_tty_struct;
+	struct termios *free_termios;
 
 	dev = filp->f_rdev;
 	if (MAJOR(dev) != 4) {
-		printk("tty_close: tty pseudo-major != 4\n");
+		printk("tty_release: tty pseudo-major != 4\n");
 		return;
 	}
 	dev = MINOR(filp->f_rdev);
-	tty = TTY_TABLE(dev);
-	if (IS_A_PTY_MASTER(dev) && tty->link)
-		tty->link->count--;
-	tty->count--;
+	if (!dev)
+		dev = fg_console+1;
+	tty = tty_table[dev];
+	if (!tty) {
+		printk("tty_release: tty_table[%d] was NULL\n", dev);
+		return;
+	}
+	if (IS_A_PTY_MASTER(dev) && tty->link)  {
+		if (--tty->link->count < 0) {
+			printk("tty_release: bad tty slave count (dev = %d): %d\n",
+			       dev, tty->count);	
+			tty->link->count = 0;
+		}
+	}
+	if (--tty->count < 0) {
+		printk("tty_release: bad tty_table[%d]->count: %d\n",
+		       dev, tty->count);
+		tty->count = 0;
+	}
 	if (tty->count)
 		return;
-	if (IS_A_SERIAL(dev)) {
-		wait_until_sent(tty);
-		serial_close(dev-64,filp);
-	} else if (IS_A_PTY(dev))
-		pty_close(dev,filp);
-	if (!tty->count && (tty == redirect))
+	if (tty->close)
+		tty->close(tty, filp);
+	if (tty == redirect)
 		redirect = NULL;
-	if (tty = tty->link)
-		if (!tty->count && (tty == redirect))
-			redirect = NULL;
+	if (tty->link && !tty->link->count && (tty->link == redirect))
+		redirect = NULL;
+	if (tty->link) {
+		if (tty->link->count)
+			return;
+		/*
+		 * Free the tty structure, being careful to avoid race conditions
+		 */
+		free_tty_struct = (unsigned long) tty_table[PTY_OTHER(dev)];
+		tty_table[PTY_OTHER(dev)] = 0;
+		free_page(free_tty_struct);
+		/*
+		 * If this is a PTY, free the termios structure, being
+		 * careful to avoid race conditions
+		 */
+		if (IS_A_PTY(dev)) {
+			free_termios = tty_termios[PTY_OTHER(dev)];
+			tty_termios[PTY_OTHER(dev)] = 0;
+			kfree_s(free_termios, sizeof(struct termios));
+		}
+	}
+	/*
+	 * Free the tty structure, being careful to avoid race conditions
+	 */
+	free_tty_struct = (unsigned long) tty_table[dev];
+	tty_table[dev] = 0;	
+	free_page(free_tty_struct);
+	/*
+	 * If this is a PTY, free the termios structure, being careful
+	 * to avoid race conditions
+	 */
+	if (IS_A_PTY(dev)) {
+		free_termios = tty_termios[dev];
+		tty_termios[dev] = 0;
+		kfree_s(free_termios, sizeof(struct termios));
+	}
 }
 
 static int tty_select(struct inode * inode, struct file * filp, int sel_type, select_table * wait)
@@ -592,18 +769,31 @@ static int tty_select(struct inode * inode, struct file * filp, int sel_type, se
 	}
 	dev = MINOR(filp->f_rdev);
 	tty = TTY_TABLE(dev);
+	if (!tty) {
+		printk("tty_select: tty struct for dev %d was NULL\n", dev);
+		return 0;
+	}
 	switch (sel_type) {
 		case SEL_IN:
-			if (!EMPTY(tty->secondary))
+			if (L_CANON(tty)) {
+				if (available_canon_input(tty))
+					return 1;
+			} else if (!EMPTY(&tty->secondary))
 				return 1;
 			if (tty->link && !tty->link->count)
 				return 1;
-			select_wait(&tty->secondary->proc_list, wait);
+
+			/* see if the status byte can be read. */
+			if (tty->packet && tty->link &&
+			    tty->link->status_changed)
+				return 1;
+
+			select_wait(&tty->secondary.proc_list, wait);
 			return 0;
 		case SEL_OUT:
-			if (!FULL(tty->write_q))
+			if (!FULL(&tty->write_q))
 				return 1;
-			select_wait(&tty->write_q->proc_list, wait);
+			select_wait(&tty->write_q.proc_list, wait);
 			return 0;
 		case SEL_EX:
 			if (tty->link && !tty->link->count)
@@ -620,106 +810,119 @@ static struct file_operations tty_fops = {
 	NULL,		/* tty_readdir */
 	tty_select,
 	tty_ioctl,
+	NULL,		/* tty_mmap */
 	tty_open,
 	tty_release
 };
+
+/*
+ * This implements the "Secure Attention Key" ---  the idea is to
+ * prevent trojan horses by killing all processes associated with this
+ * tty when the user hits the "Secure Attention Key".  Required for
+ * super-paranoid applications --- see the Orange Book for more details.
+ * 
+ * This code could be nicer; ideally it should send a HUP, wait a few
+ * seconds, then send a INT, and then a KILL signal.  But you then
+ * have to coordinate with the init process, since all processes associated
+ * with the current tty must be dead before the new getty is allowed
+ * to spawn.
+ */
+void do_SAK( struct tty_struct *tty)
+{
+	struct task_struct **p;
+	int line = tty->line;
+	int session = tty->session;
+	int		i;
+	struct file	*filp;
+	
+	flush_input(tty);
+	flush_output(tty);
+ 	for (p = &LAST_TASK ; p > &FIRST_TASK ; --p) {
+		if (!(*p))
+			continue;
+		if (((*p)->tty == line) ||
+		    ((session > 0) && ((*p)->session == session)))
+			send_sig(SIGKILL, *p, 1);
+		else {
+			for (i=0; i < NR_FILE; i++) {
+				filp = (*p)->filp[i];
+				if (filp && (filp->f_op == &tty_fops) &&
+				    (MINOR(filp->f_rdev) == line)) {
+					send_sig(SIGKILL, *p, 1);
+					break;
+				}
+			}
+		}
+	}
+}
+
+/*
+ * This subroutine initializes a tty structure.  We have to set up
+ * things correctly for each different type of tty.
+ */
+static int initialize_tty_struct(struct tty_struct *tty, int line)
+{
+	struct termios *tp = tty_termios[line];
+
+	memset(tty, 0, sizeof(struct tty_struct));
+	tty->line = line;
+	tty->pgrp = -1;
+	tty->winsize.ws_row = 24;
+	tty->winsize.ws_col = 80;
+	if (!tty_termios[line]) {
+		tp = kmalloc(sizeof(struct termios), GFP_KERNEL);
+		if (!tty_termios[line]) {
+			if (!tp)
+				return -ENOMEM;
+			memset(tp, 0, sizeof(struct termios));
+			memcpy(tp->c_cc, INIT_C_CC, NCCS);
+			if (IS_A_CONSOLE(line)) {
+				tp->c_iflag = ICRNL | IXON;
+				tp->c_oflag = OPOST | ONLCR;
+				tp->c_cflag = B38400 | CS8 | CREAD;
+				tp->c_lflag = ISIG | ICANON | ECHO |
+					ECHOCTL | ECHOKE;
+			} else if (IS_A_SERIAL(line)) {
+				tp->c_cflag = B2400 | CS8 | CREAD | HUPCL;
+			} else if (IS_A_PTY_MASTER(line)) {
+				tp->c_cflag = B9600 | CS8 | CREAD;
+			} else if (IS_A_PTY_SLAVE(line)) {
+				tp->c_iflag = ICRNL | IXON;
+				tp->c_oflag = OPOST | ONLCR;
+				tp->c_cflag = B38400 | CS8 | CREAD;
+				tp->c_lflag = ISIG | ICANON | ECHO |
+					ECHOCTL | ECHOKE;
+			}
+			tty_termios[line] = tp;
+		}
+	}
+	tty->termios = tty_termios[line];
+	
+	if (IS_A_CONSOLE(line)) {
+		tty->open = con_open;
+		tty->winsize.ws_row = video_num_lines;
+		tty->winsize.ws_col = video_num_columns;
+	} else if IS_A_SERIAL(line) {
+		tty->open = rs_open;
+	} else if IS_A_PTY(line) {
+		tty->open = pty_open;
+	}
+	return 0;
+}
 
 long tty_init(long kmem_start)
 {
 	int i;
 
-	tty_queues = (struct tty_queue *) kmem_start;
-	kmem_start += QUEUES * (sizeof (struct tty_queue));
-	table_list[0] = con_queues + 0;
-	table_list[1] = con_queues + 1;
 	chrdev_fops[4] = &tty_fops;
 	chrdev_fops[5] = &tty_fops;
-	for (i=0 ; i < QUEUES ; i++)
-		tty_queues[i] = (struct tty_queue) {0,0,0,0,""};
 	for (i=0 ; i<256 ; i++) {
-		tty_table[i] =  (struct tty_struct) {
-		 	{0, 0, 0, 0, 0, INIT_C_CC},
-			-1, 0, 0, 0, 0, {0,0,0,0},
-			NULL, NULL, NULL, NULL, NULL
-		};
+		tty_table[i] =  0;
+		tty_termios[i] = 0;
 	}
+	kmem_start = kbd_init(kmem_start);
 	kmem_start = con_init(kmem_start);
-	for (i = 0 ; i<NR_CONSOLES ; i++) {
-		con_table[i] = (struct tty_struct) {
-		 	{ICRNL,		/* change incoming CR to NL */
-			OPOST|ONLCR,	/* change outgoing NL to CRNL */
-			B38400 | CS8,
-			IXON | ISIG | ICANON | ECHO | ECHOCTL | ECHOKE,
-			0,		/* console termio */
-			INIT_C_CC},
-			-1,		/* initial pgrp */
-			0,			/* initial session */
-			0,			/* initial stopped */
-			0,			/* initial flags */
-			0,			/* initial count */
-			{video_num_lines,video_num_columns,0,0},
-			con_write,
-			NULL,		/* other-tty */
-			con_queues+0+i*3,con_queues+1+i*3,con_queues+2+i*3
-		};
-	}
-	for (i = 0 ; i<NR_SERIALS ; i++) {
-		rs_table[i] = (struct tty_struct) {
-			{0, /* no translation */
-			0,  /* no translation */
-			B2400 | CS8,
-			0,
-			0,
-			INIT_C_CC},
-			-1,
-			0,
-			0,
-			0,
-			0,
-			{25,80,0,0},
-			rs_write,
-			NULL,		/* other-tty */
-			rs_queues+0+i*3,rs_queues+1+i*3,rs_queues+2+i*3
-		};
-	}
-	for (i = 0 ; i<NR_PTYS ; i++) {
-		mpty_table[i] = (struct tty_struct) {
-			{0, /* no translation */
-			0,  /* no translation */
-			B9600 | CS8,
-			0,
-			0,
-			INIT_C_CC},
-			-1,
-			0,
-			0,
-			0,
-			0,
-			{25,80,0,0},
-			mpty_write,
-			spty_table+i,
-			mpty_queues+0+i*3,mpty_queues+1+i*3,mpty_queues+2+i*3
-		};
-		spty_table[i] = (struct tty_struct) {
-			{0, /* no translation */
-			0,  /* no translation */
-			B9600 | CS8,
-			IXON | ISIG | ICANON,
-			0,
-			INIT_C_CC},
-			-1,
-			0,
-			0,
-			0,
-			0,
-			{25,80,0,0},
-			spty_write,
-			mpty_table+i,
-			spty_queues+0+i*3,spty_queues+1+i*3,spty_queues+2+i*3
-		};
-	}
 	kmem_start = rs_init(kmem_start);
 	printk("%d virtual consoles\n\r",NR_CONSOLES);
-	printk("%d pty's\n\r",NR_PTYS);
 	return kmem_start;
 }

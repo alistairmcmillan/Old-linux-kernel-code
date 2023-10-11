@@ -39,6 +39,7 @@ static struct file_operations def_chr_fops = {
 	NULL,		/* readdir */
 	NULL,		/* select */
 	NULL,		/* ioctl */
+	NULL,		/* mmap */
 	chrdev_open,	/* open */
 	NULL,		/* release */
 };
@@ -56,7 +57,7 @@ struct inode_operations minix_chrdev_inode_operations = {
 	NULL,			/* rename */
 	NULL,			/* readlink */
 	NULL,			/* follow_link */
-	minix_bmap,		/* bmap */
-	minix_truncate		/* truncate */
+	NULL,			/* bmap */
+	NULL			/* truncate */
 };
 

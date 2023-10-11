@@ -7,9 +7,14 @@
 /*
  *	console.c
  *
- * This module implements the console io functions
+ * This module exports the console io functions:
+ * 
  *	'long con_init(long)'
- *	'void con_write(struct tty_queue * queue)'
+ *	'void con_open(struct tty_queue * queue, struct )'
+ * 	'void update_screen(int new_console)'
+ * 	'void blank_screen(void)'
+ * 	'void unblank_screen(void)'
+ * 
  * Hopefully this will be a rather complete VT102 implementation.
  *
  * Beeping thanks to John T Kohl.
@@ -30,8 +35,6 @@
  * <g-hunt@ee.utah.edu>
  */
 
-#define KEYBOARD_IRQ 1
-
 #include <linux/sched.h>
 #include <linux/timer.h>
 #include <linux/tty.h>
@@ -39,27 +42,19 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/errno.h>
+#include <linux/kd.h>
+#include <linux/keyboard.h>
 
 #include <asm/io.h>
 #include <asm/system.h>
 #include <asm/segment.h>
 
-#include <sys/kd.h>
 #include "vt_kern.h"
 
 #define NPAR 16
 
 extern void vt_init(void);
-extern void keyboard_interrupt(int pt_regs);
 extern void set_leds(void);
-extern unsigned char kapplic;
-extern unsigned char ckmode;
-extern unsigned char krepeat;
-extern unsigned char kleds;
-extern unsigned char kmode;
-extern unsigned char kraw;
-extern unsigned char ke0;
-extern unsigned char lfnlmode;
 
 unsigned long	video_num_columns;		/* Number of text columns	*/
 unsigned long	video_num_lines;		/* Number of test lines		*/
@@ -93,17 +88,13 @@ static struct {
 	unsigned long	vc_saved_x;
 	unsigned long	vc_saved_y;
 	/* mode flags */
-	unsigned long	vc_kbdapplic	: 1;	/* Application keyboard */
 	unsigned long	vc_charset	: 1;	/* Character set G0 / G1 */
 	unsigned long	vc_s_charset	: 1;	/* Saved character set */
-	unsigned long	vc_decckm	: 1;	/* Cursor Keys Mode */
 	unsigned long	vc_decscnm	: 1;	/* Screen Mode */
 	unsigned long	vc_decom	: 1;	/* Origin Mode */
 	unsigned long	vc_decawm	: 1;	/* Autowrap Mode */
-	unsigned long	vc_decarm	: 1;	/* Autorepeat Mode */
 	unsigned long	vc_deccm	: 1;	/* Cursor Visible */
 	unsigned long	vc_decim	: 1;	/* Insert Mode */
-	unsigned long	vc_lnm		: 1;	/* Line feed New line Mode */
 	/* attribute flags */
 	unsigned long	vc_intensity	: 2;	/* 0=half-bright, 1=normal, 2=bold */
 	unsigned long	vc_underline	: 1;
@@ -154,15 +145,11 @@ static int console_blanked = 0;
 #define video_mem_start	(vc_cons[currcons].vc_video_mem_start)
 #define video_mem_end	(vc_cons[currcons].vc_video_mem_end)
 #define video_erase_char (vc_cons[currcons].vc_video_erase_char)	
-#define decckm		(vc_cons[currcons].vc_decckm)
 #define decscnm		(vc_cons[currcons].vc_decscnm)
 #define decom		(vc_cons[currcons].vc_decom)
 #define decawm		(vc_cons[currcons].vc_decawm)
-#define decarm		(vc_cons[currcons].vc_decarm)
 #define deccm		(vc_cons[currcons].vc_deccm)
 #define decim		(vc_cons[currcons].vc_decim)
-#define lnm		(vc_cons[currcons].vc_lnm)
-#define kbdapplic	(vc_cons[currcons].vc_kbdapplic)
 #define need_wrap	(vc_cons[currcons].vc_need_wrap)
 #define color		(vc_cons[currcons].vc_color)
 #define s_color		(vc_cons[currcons].vc_s_color)
@@ -183,14 +170,17 @@ static int console_blanked = 0;
 #define	halfcolor	(vc_cons[currcons].vc_halfcolor)
 #define kbdmode		(vc_cons[currcons].vc_kbdmode)
 #define tab_stop	(vc_cons[currcons].vc_tab_stop)
-#define kbdraw		(vt_cons[currcons].vc_kbdraw)
-#define kbdleds		(vt_cons[currcons].vc_kbdleds)
 #define vtmode		(vt_cons[currcons].vt_mode)
 
-#define SET(mode,fg,v) \
-	(mode) = (v); \
-	if (currcons == fg_console) \
-		(fg) = (v)
+#define set_kbd(x) set_vc_kbd_flag(kbd_table+currcons,x)
+#define clr_kbd(x) clr_vc_kbd_flag(kbd_table+currcons,x)
+#define is_kbd(x) vc_kbd_flag(kbd_table+currcons,x)
+
+#define decarm		VC_REPEAT
+#define decckm		VC_CKMODE
+#define kbdapplic	VC_APPLIC
+#define kbdraw		VC_RAW
+#define lnm		VC_CRLF
 
 int blankinterval = 10*60*HZ;
 static int screen_size = 0;
@@ -605,7 +595,7 @@ static inline void set_cursor(int currcons)
 static void respond_string(char * p, int currcons, struct tty_struct * tty)
 {
 	while (*p) {
-		put_tty_queue(*p,tty->read_q);
+		put_tty_queue(*p, &tty->read_q);
 		p++;
 	}
 	TTY_READ_FLUSH(tty);
@@ -621,19 +611,19 @@ static void respond_num(unsigned int n, int currcons, struct tty_struct * tty)
 		n /= 10;
 	} while(n && i < 3);	/* We'll take no chances */
 	while (i--) {
-		put_tty_queue(buff[i],tty->read_q);
+		put_tty_queue(buff[i], &tty->read_q);
 	}
 	/* caller must flush */
 }
 
 static void cursor_report(int currcons, struct tty_struct * tty)
 {
-	put_tty_queue('\033', tty->read_q);
-	put_tty_queue('[', tty->read_q);
+	put_tty_queue('\033', &tty->read_q);
+	put_tty_queue('[', &tty->read_q);
 	respond_num(y + (decom ? top+1 : 1), currcons, tty);
-	put_tty_queue(';', tty->read_q);
+	put_tty_queue(';', &tty->read_q);
 	respond_num(x+1, currcons, tty);
-	put_tty_queue('R', tty->read_q);
+	put_tty_queue('R', &tty->read_q);
 	TTY_READ_FLUSH(tty);
 }
 
@@ -665,7 +655,10 @@ static void set_mode(int currcons, int on_off)
 	for (i=0; i<=npar; i++)
 		if (ques) switch(par[i]) {	/* DEC private modes set/reset */
 			case 1:			/* Cursor keys send ^[Ox/^[[x */
-				SET(decckm,ckmode,on_off);
+				if (on_off)
+					set_kbd(decckm);
+				else
+					clr_kbd(decckm);
 				break;
 			case 3:	/* 80/132 mode switch unimplemented */
 				csi_J(currcons,2);
@@ -686,7 +679,10 @@ static void set_mode(int currcons, int on_off)
 				decawm = on_off;
 				break;
 			case 8:			/* Autorepeat on/off */
-				SET(decarm,krepeat,on_off);
+				if (on_off)
+					set_kbd(decarm);
+				else
+					clr_kbd(decarm);
 				break;
 			case 25:		/* Cursor on/off */
 				deccm = on_off;
@@ -697,7 +693,10 @@ static void set_mode(int currcons, int on_off)
 				decim = on_off;
 				break;
 			case 20:		/* Lf, Enter == CrLf/Lf */
-				SET(lnm,lfnlmode,on_off);
+				if (on_off)
+					set_kbd(lnm);
+				else
+					clr_kbd(lnm);
 				break;
 		}
 }
@@ -861,22 +860,15 @@ static void reset_terminal(int currcons, int do_clear)
 	deccm		= 1;
 	decim		= 0;
 
-	if (currcons == fg_console) {
-		krepeat		= 1;
-		ckmode		= 0;
-		kapplic		= 0;
-		lfnlmode	= 0;
-		kleds		= 2;
-		kmode		= 0;
-		set_leds();
-	} else {
-		decarm		= 1;
-		decckm		= 0;
-		kbdapplic	= 0;
-		lnm		= 0;
-		kbdleds		= 2;
-		kbdmode		= 0;
-	}
+	set_kbd(decarm);
+	clr_kbd(decckm);
+	clr_kbd(kbdapplic);
+	clr_kbd(lnm);
+	kbd_table[currcons].flags =
+		(kbd_table[currcons].flags & ~LED_MASK) |
+		(kbd_table[currcons].default_flags & LED_MASK);
+	kbdmode		= 0;
+	set_leds();
 
 	default_attr(currcons);
 	update_attr(currcons);
@@ -899,13 +891,13 @@ void con_write(struct tty_struct * tty)
 	int c;
 	unsigned int currcons;
 
-	wake_up(&tty->write_q->proc_list);
-	currcons = tty - tty_table;
+	wake_up_interruptible(&tty->write_q.proc_list);
+	currcons = tty->line - 1;
 	if (currcons >= NR_CONSOLES) {
-		printk("con_write: illegal tty\n\r");
+		printk("con_write: illegal tty (%d)\n", currcons);
 		return;
 	}
-	while (!tty->stopped &&	(c = get_tty_queue(tty->write_q)) >= 0) {
+	while (!tty->stopped &&	(c = get_tty_queue(&tty->write_q)) >= 0) {
 		if (state == ESnormal && translate[c]) {
 			if (need_wrap) {
 				cr(currcons);
@@ -929,13 +921,13 @@ void con_write(struct tty_struct * tty)
 		 *  Control characters can be used in the _middle_
 		 *  of an escape sequence.
 		 */
-		if (c < 32 || c == 127) switch(c) {
+		switch (c) {
 			case 7:
 				sysbeep();
-				break;
+				continue;
 			case 8:
 				bs(currcons);
-				break;
+				continue;
 			case 9:
 				pos -= (x << 1);
 				while (x < video_num_columns - 1) {
@@ -944,80 +936,84 @@ void con_write(struct tty_struct * tty)
 						break;
 				}
 				pos += (x << 1);
-				break;
+				continue;
 			case 10: case 11: case 12:
 				lf(currcons);
-				if (!lfnlmode)
-					break;
+				if (!is_kbd(lnm))
+					continue;
 			case 13:
 				cr(currcons);
-				break;
+				continue;
 			case 14:
 				charset = 1;
 				translate = G1_charset;
-				break;
+				continue;
 			case 15:
 				charset = 0;
 				translate = G0_charset;
-				break;
+				continue;
 			case 24: case 26:
 				state = ESnormal;
-				break;
+				continue;
 			case 27:
 				state = ESesc;
-				break;
+				continue;
 			case 127:
 				del(currcons);
-				break;
-		} else switch(state) {
+				continue;
+			case 128+27:
+				state = ESsquare;
+				continue;
+		}
+		switch(state) {
 			case ESesc:
 				state = ESnormal;
 				switch (c) {
 				  case '[':
 					state = ESsquare;
-					break;
+					continue;
 				  case 'E':
 					cr(currcons);
 					lf(currcons);
-					break;
+					continue;
 				  case 'M':
 					ri(currcons);
-					break;
+					continue;
 				  case 'D':
 					lf(currcons);
-					break;
+					continue;
 				  case 'H':
 					tab_stop[x >> 5] |= (1 << (x & 31));
-					break;
+					continue;
 				  case 'Z':
 					respond_ID(currcons,tty);
-					break;
+					continue;
 				  case '7':
 					save_cur(currcons);
-					break;
+					continue;
 				  case '8':
 					restore_cur(currcons);
-					break;
+					continue;
 				  case '(':
 					state = ESsetG0;
-					break;
+					continue;
 				  case ')':
 					state = ESsetG1;
-					break;
+					continue;
 				  case '#':
 					state = EShash;
-					break;
+					continue;
 				  case 'c':
 					reset_terminal(currcons,1);
-					break;
+					continue;
 				  case '>':  /* Numeric keypad */
-					SET(kbdapplic,kapplic,0);
-					break;
+					clr_kbd(kbdapplic);
+					continue;
 				  case '=':  /* Appl. keypad */
-					SET(kbdapplic,kapplic,1);
-				 	break;
+					set_kbd(kbdapplic);
+				 	continue;
 				}	
-				break;
+				continue;
 			case ESsquare:
 				for(npar = 0 ; npar < NPAR ; npar++)
 					par[npar] = 0;
@@ -1025,97 +1021,98 @@ void con_write(struct tty_struct * tty)
 				state = ESgetpars;
 				if (c == '[') { /* Function key */
 					state=ESfunckey;
-					break;
+					continue;
 				}
-				if (ques=(c=='?'))
-					break;
+				ques = (c=='?');
+				if (ques)
+					continue;
 			case ESgetpars:
 				if (c==';' && npar<NPAR-1) {
 					npar++;
-					break;
+					continue;
 				} else if (c>='0' && c<='9') {
 					par[npar] *= 10;
 					par[npar] += c-'0';
-					break;
+					continue;
 				} else state=ESgotpars;
 			case ESgotpars:
 				state = ESnormal;
 				switch(c) {
 					case 'h':
 						set_mode(currcons,1);
-						break;
+						continue;
 					case 'l':
 						set_mode(currcons,0);
-						break;
+						continue;
 					case 'n':
 						if (!ques)
 							if (par[0] == 5)
 								status_report(currcons,tty);
 							else if (par[0] == 6)
 								cursor_report(currcons,tty);
-						break;
+						continue;
 				}
 				if (ques) {
 					ques = 0;
-					break;
+					continue;
 				}
 				switch(c) {
 					case 'G': case '`':
 						if (par[0]) par[0]--;
 						gotoxy(currcons,par[0],y);
-						break;
+						continue;
 					case 'A':
 						if (!par[0]) par[0]++;
 						gotoxy(currcons,x,y-par[0]);
-						break;
+						continue;
 					case 'B': case 'e':
 						if (!par[0]) par[0]++;
 						gotoxy(currcons,x,y+par[0]);
-						break;
+						continue;
 					case 'C': case 'a':
 						if (!par[0]) par[0]++;
 						gotoxy(currcons,x+par[0],y);
-						break;
+						continue;
 					case 'D':
 						if (!par[0]) par[0]++;
 						gotoxy(currcons,x-par[0],y);
-						break;
+						continue;
 					case 'E':
 						if (!par[0]) par[0]++;
 						gotoxy(currcons,0,y+par[0]);
-						break;
+						continue;
 					case 'F':
 						if (!par[0]) par[0]++;
 						gotoxy(currcons,0,y-par[0]);
-						break;
+						continue;
 					case 'd':
 						if (par[0]) par[0]--;
 						gotoxy(currcons,x,par[0]);
-						break;
+						continue;
 					case 'H': case 'f':
 						if (par[0]) par[0]--;
 						if (par[1]) par[1]--;
 						gotoxy(currcons,par[1],par[0]);
-						break;
+						continue;
 					case 'J':
 						csi_J(currcons,par[0]);
-						break;
+						continue;
 					case 'K':
 						csi_K(currcons,par[0]);
-						break;
+						continue;
 					case 'L':
 						csi_L(currcons,par[0]);
-						break;
+						continue;
 					case 'M':
 						csi_M(currcons,par[0]);
-						break;
+						continue;
 					case 'P':
 						csi_P(currcons,par[0]);
-						break;
+						continue;
 					case 'c':
 						if (!par[0])
 							respond_ID(currcons,tty);
-						break;
+						continue;
 					case 'g':
 						if (!par[0])
 							tab_stop[x >> 5] &= ~(1 << (x & 31));
@@ -1126,10 +1123,10 @@ void con_write(struct tty_struct * tty)
 							tab_stop[3] =
 							tab_stop[4] = 0;
 						}
-						break;
+						continue;
 					case 'm':
 						csi_m(currcons);
-						break;
+						continue;
 					case 'r':
 						if (!par[0])
 							par[0]++;
@@ -1142,24 +1139,24 @@ void con_write(struct tty_struct * tty)
 							bottom=par[1];
 							gotoxy(currcons,0,0);
 						}
-						break;
+						continue;
 					case 's':
 						save_cur(currcons);
-						break;
+						continue;
 					case 'u':
 						restore_cur(currcons);
-						break;
+						continue;
 					case '@':
 						csi_at(currcons,par[0]);
-						break;
+						continue;
 					case ']': /* setterm functions */
 						setterm_command(currcons);
-						break;
+						continue;
 				}
-				break;
+				continue;
 			case ESfunckey:
 				state = ESnormal;
-				break;
+				continue;
 			case EShash:
 				state = ESnormal;
 				if (c == '8') {
@@ -1170,7 +1167,7 @@ void con_write(struct tty_struct * tty)
 					video_erase_char =
 						(video_erase_char & 0xff00) | ' ';
 				}
-				break;
+				continue;
 			case ESsetG0:
 				if (c == '0')
 					G0_charset = GRAF_TRANS;
@@ -1181,7 +1178,7 @@ void con_write(struct tty_struct * tty)
 				if (charset == 0)
 					translate = G0_charset;
 				state = ESnormal;
-				break;
+				continue;
 			case ESsetG1:
 				if (c == '0')
 					G1_charset = GRAF_TRANS;
@@ -1192,7 +1189,7 @@ void con_write(struct tty_struct * tty)
 				if (charset == 1)
 					translate = G1_charset;
 				state = ESnormal;
-				break;
+				continue;
 			default:
 				state = ESnormal;
 		}
@@ -1239,7 +1236,6 @@ return s;
  */
 long con_init(long kmem_start)
 {
-	register unsigned char a;
 	char *display_desc = "????";
 	char *display_ptr;
 	int currcons = 0;
@@ -1316,7 +1312,7 @@ long con_init(long kmem_start)
 		scr_end = video_mem_end = (base += screen_size);
 		vc_scrbuf[currcons] = (unsigned short *) origin;
 		vtmode		= KD_TEXT;
-		kbdraw		= 0;
+		clr_kbd(kbdraw);
 		def_color	= 0x07;   /* white */
 		ulcolor		= 0x0f;   /* bold white */
 		halfcolor	= 0x08;   /* grey */
@@ -1332,34 +1328,15 @@ long con_init(long kmem_start)
 	save_cur(currcons);
 	gotoxy(currcons,orig_x,orig_y);
 	update_screen(fg_console);
-
-	if (request_irq(KEYBOARD_IRQ,keyboard_interrupt))
-		printk("Unable to get IRQ%d for keyboard driver\n",KEYBOARD_IRQ);
-	a=inb_p(0x61);
-	outb_p(a|0x80,0x61);
-	outb_p(a,0x61);
 	return kmem_start;
 }
 
+/*
+ * kbdsave doesn't need to do anything: it's all handled automatically
+ * with the new data structures..
+ */
 void kbdsave(int new_console)
 {
-	int currcons = fg_console;
-	kbdmode = kmode;
-	kbdraw = kraw;
-	kbdleds = kleds;
-	kbdapplic = kapplic;
-	decckm = ckmode;
-	decarm = krepeat;
-	lnm = lfnlmode;
-	currcons = new_console;
-	kmode = (kmode & 0x3F) | (kbdmode & 0xC0);
-	kraw = kbdraw;
-	kleds = kbdleds;
-	kapplic = kbdapplic;
-	ckmode = decckm;
-	krepeat = decarm;
-	lfnlmode = lnm;
-	set_leds();
 }
 
 static void get_scrmem(int currcons)
@@ -1416,6 +1393,7 @@ void update_screen(int new_console)
 	set_scrmem(fg_console); 
 	set_origin(fg_console);
 	set_cursor(new_console);
+	set_leds();
 	lock = 0;
 }
 
@@ -1467,7 +1445,7 @@ void console_print(const char * b)
 
 	if (currcons<0 || currcons>=NR_CONSOLES)
 		currcons = 0;
-	while (c = *(b++)) {
+	while ((c = *(b++)) != 0) {
 		if (c == 10 || c == 13 || need_wrap) {
 			if (c != 13)
 				lf(currcons);
@@ -1495,4 +1473,15 @@ void console_print(const char * b)
 		timer_table[BLANK_TIMER].expires = jiffies + blankinterval;
 		timer_active |= 1<<BLANK_TIMER;
 	}
+}
+
+/*
+ * All we do is set the write and ioctl subroutines; later on maybe we'll
+ * dynamically allocate the console screen memory.
+ */
+int con_open(struct tty_struct *tty, struct file * filp)
+{
+	tty->write = con_write;
+	tty->ioctl = vt_ioctl;
+	return 0;
 }
