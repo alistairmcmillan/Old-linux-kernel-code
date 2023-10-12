@@ -18,6 +18,8 @@
 #include <linux/head.h>
 #include <linux/unistd.h>
 #include <linux/string.h>
+#include <linux/timer.h>
+#include <linux/fs.h>
 
 extern unsigned long * prof_buffer;
 extern unsigned long prof_len;
@@ -78,6 +80,7 @@ extern unsigned long scsi_dev_init(unsigned long, unsigned long);
 #define EXT_MEM_K (*(unsigned short *)0x90002)
 #define DRIVE_INFO (*(struct drive_info *)0x90080)
 #define SCREEN_INFO (*(struct screen_info *)0x90000)
+#define MOUNT_ROOT_RDONLY (*(unsigned short *)0x901F2)
 #define RAMDISK_SIZE (*(unsigned short *)0x901F8)
 #define ORIG_ROOT_DEV (*(unsigned short *)0x901FC)
 #define AUX_DEVICE_INFO (*(unsigned char *)0x901FF)
@@ -151,6 +154,9 @@ struct screen_info screen_info;
 
 unsigned char aux_device_present;
 int ramdisk_size;
+int root_mountflags = 0;
+
+static char fpu_error = 0;
 
 static char command_line[80] = { 0, };
 
@@ -185,6 +191,14 @@ static void parse_options(char *line)
 			ROOT_DEV = simple_strtoul(line+5,NULL,16);
 			continue;
 		}
+		if (!strcmp(line,"ro")) {
+			root_mountflags |= MS_RDONLY;
+			continue;
+		}
+		if (!strcmp(line,"rw")) {
+			root_mountflags &= ~MS_RDONLY;
+			continue;
+		}		
 		/*
 		 * Then check if it's an environment variable or
 		 * an option.
@@ -201,6 +215,17 @@ static void parse_options(char *line)
 	}
 	argv_init[args+1] = NULL;
 	envp_init[envs+1] = NULL;
+}
+
+static void copro_timeout(void)
+{
+	fpu_error = 1;
+	timer_table[COPRO_TIMER].expires = jiffies+100;
+	timer_active |= 1<<COPRO_TIMER;
+	printk("387 failed: trying to reset\n");
+	send_sig(SIGFPE, last_task_used_math, 1);
+	outb_p(0,0xf1);
+	outb_p(0,0xf0);
 }
 
 void start_kernel(void)
@@ -220,6 +245,8 @@ void start_kernel(void)
 	if (memory_end > 16*1024*1024)
 		memory_end = 16*1024*1024;
 #endif
+	if (MOUNT_ROOT_RDONLY)
+		root_mountflags |= MS_RDONLY;
 	if ((unsigned long)&end >= (1024*1024)) {
 		memory_start = (unsigned long) &end;
 		low_memory_start = 4096;
@@ -266,13 +293,19 @@ void start_kernel(void)
 	if (hard_math) {
 		unsigned short control_word;
 
-		printk("Checking for 387 error mechanism ...");
-		__asm__("fninit ; fnstcw %0 ; fwait":"=m" (*&control_word));
+		timer_table[COPRO_TIMER].expires = jiffies+50;
+		timer_table[COPRO_TIMER].fn = copro_timeout;
+		timer_active |= 1<<COPRO_TIMER;
+		printk("You have a bad 386/387 coupling.\r");
+		__asm__("clts ; fninit ; fnstcw %0 ; fwait":"=m" (*&control_word));
 		control_word &= 0xffc0;
 		__asm__("fldcw %0 ; fwait"::"m" (*&control_word));
 		outb_p(inb_p(0x21) | (1 << 2), 0x21);
 		__asm__("fldz ; fld1 ; fdiv %st,%st(1) ; fwait");
-		printk(" ok, using %s.\n",ignore_irq13?"exception 16":"irq13");
+		timer_active &= ~(1<<COPRO_TIMER);
+		if (!fpu_error)
+			printk("Math coprocessor using %s error reporting.\n",
+				ignore_irq13?"exception 16":"irq13");
 	}
 	move_to_user_mode();
 	if (!fork())		/* we count on this going ok */

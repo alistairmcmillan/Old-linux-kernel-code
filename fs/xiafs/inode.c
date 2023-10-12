@@ -55,7 +55,8 @@ static struct super_operations xiafs_sops = {
     xiafs_statfs
 };
 
-struct super_block *xiafs_read_super(struct super_block *s, void *data)
+struct super_block *xiafs_read_super(struct super_block *s, void *data,
+				     int silent)
 {
     struct buffer_head *bh;
     struct xiafs_super_block *sp;
@@ -75,7 +76,9 @@ struct super_block *xiafs_read_super(struct super_block *s, void *data)
         s->s_dev = 0;
 	unlock_super(s);
 	brelse(bh);
-	printk("XIA-FS: super magic mismatch\n");
+	if (!silent)
+		printk("VFS: Can't find a xiafs filesystem on dev 0x%04x.\n",
+		   dev);
 	return NULL;
     }
     s->s_blocksize = sp->s_zone_size;
@@ -150,6 +153,7 @@ void xiafs_statfs(struct super_block *sb, struct statfs *buf)
     put_fs_long(tmp, &buf->f_bavail);
     put_fs_long(sb->u.xiafs_sb.s_ninodes, &buf->f_files);
     put_fs_long(xiafs_count_free_inodes(sb), &buf->f_ffree);
+    put_fs_long(_XIAFS_NAME_LEN, &buf->f_namelen);
     /* don't know what should be put in buf->f_fsid */
 }
 
@@ -176,8 +180,10 @@ int xiafs_bmap(struct inode * inode,int zone)
         printk("XIA-FS: zone > big (%s %d)\n", WHERE_ERR);
 	return 0;
     }
-    inode->i_atime = CURRENT_TIME;
-    inode->i_dirt = 1;
+    if (!IS_RDONLY (inode)) {
+	inode->i_atime = CURRENT_TIME;
+	inode->i_dirt = 1;
+    }
     if (zone < 8)
         return inode->u.xiafs_i.i_zone[zone];
     zone -= 8;
@@ -236,6 +242,7 @@ repeat:
         goto repeat;
     }
     *lp = tmp;
+    inode->i_blocks+=2 << XIAFS_ZSHIFT(inode->i_sb);
     return result;
 }
 
@@ -279,17 +286,18 @@ repeat:
     }
     result = getblk(bh->b_dev, tmp, XIAFS_ZSIZE(inode->i_sb));
     if (*lp) {
-        xiafs_free_zone(inode->i_sb,tmp);
+        xiafs_free_zone(inode->i_sb, tmp);
 	brelse(result);
 	goto repeat;
     }
     *lp = tmp;
+    inode->i_blocks+=2 << XIAFS_ZSHIFT(inode->i_sb);
     bh->b_dirt = 1;
     brelse(bh);
     return result;
 }
 
-struct buffer_head * xiafs_getblk(struct inode * inode, int zone,	int create)
+struct buffer_head * xiafs_getblk(struct inode * inode, int zone, int create)
 {
     struct buffer_head * bh;
     u_long prev_addr=0;
@@ -368,15 +376,16 @@ void xiafs_read_inode(struct inode * inode)
     inode->i_mtime = raw_inode->i_mtime;
     inode->i_atime = raw_inode->i_atime;
     inode->i_ctime = raw_inode->i_ctime;
-    inode->i_blocks = 0;
-    inode->i_blksize = 0;			/* let vfs estimate */
-    if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode))
+    inode->i_blksize = XIAFS_ZSIZE(inode->i_sb);
+    if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode)) {
+        inode->i_blocks=0;
         inode->i_rdev = raw_inode->i_zone[0];
-    else {
+    } else {
+        XIAFS_GET_BLOCKS(raw_inode, inode->i_blocks);
         for (zone = 0; zone < 8; zone++)
-	    inode->u.xiafs_i.i_zone[zone] = raw_inode->i_zone[zone];
-	inode->u.xiafs_i.i_ind_zone = raw_inode->i_ind_zone;
-	inode->u.xiafs_i.i_dind_zone = raw_inode->i_dind_zone;
+	    inode->u.xiafs_i.i_zone[zone] = raw_inode->i_zone[zone] & 0xffffff;
+	inode->u.xiafs_i.i_ind_zone       = raw_inode->i_ind_zone   & 0xffffff;
+	inode->u.xiafs_i.i_dind_zone      = raw_inode->i_dind_zone  & 0xffffff;
     }
     brelse(bh);
     if (S_ISREG(inode->i_mode))
@@ -389,14 +398,8 @@ void xiafs_read_inode(struct inode * inode)
         inode->i_op = &chrdev_inode_operations;
     else if (S_ISBLK(inode->i_mode))
         inode->i_op = &blkdev_inode_operations;
-    else if (S_ISFIFO(inode->i_mode)) {
-        inode->i_op = &fifo_inode_operations;
-	inode->i_pipe = 1;
-	PIPE_BASE(*inode) = NULL;
-	PIPE_HEAD(*inode) = PIPE_TAIL(*inode) = 0;
-	PIPE_READ_WAIT(*inode) = PIPE_WRITE_WAIT(*inode) = NULL;
-	PIPE_READERS(*inode) = PIPE_WRITERS(*inode) = 0;
-    }
+    else if (S_ISFIFO(inode->i_mode))
+    	init_fifo(inode);
 }
 
 void xiafs_write_inode(struct inode * inode)
@@ -405,6 +408,12 @@ void xiafs_write_inode(struct inode * inode)
     struct xiafs_inode * raw_inode;
     int zone;
     ino_t ino;
+
+    if (IS_RDONLY (inode)) {
+	printk("XIA-FS: write_inode on a read-only filesystem (%s %d)\n", WHERE_ERR);
+	inode->i_dirt = 0;
+	return;
+    }
 
     ino = inode->i_ino;
     if (!ino || ino > inode->i_sb->u.xiafs_sb.s_ninodes) {
@@ -427,20 +436,20 @@ void xiafs_write_inode(struct inode * inode)
     raw_inode->i_gid = inode->i_gid;
     raw_inode->i_nlinks = inode->i_nlink;
     raw_inode->i_size = inode->i_size;
-    if (inode->i_ctime < inode->i_mtime)
-    	inode->i_ctime=inode->i_mtime;
-    if (inode->i_atime < inode->i_ctime)
-    	inode->i_atime=inode->i_ctime;
     raw_inode->i_atime = inode->i_atime;
     raw_inode->i_ctime = inode->i_ctime;
     raw_inode->i_mtime = inode->i_mtime;
     if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode))
         raw_inode->i_zone[0] = inode->i_rdev;
     else {
+        XIAFS_PUT_BLOCKS(raw_inode, inode->i_blocks);
         for (zone = 0; zone < 8; zone++)
-	    raw_inode->i_zone[zone] = inode->u.xiafs_i.i_zone[zone];
-	raw_inode->i_ind_zone = inode->u.xiafs_i.i_ind_zone;
-	raw_inode->i_dind_zone = inode->u.xiafs_i.i_dind_zone;
+	    raw_inode->i_zone[zone] = (raw_inode->i_zone[zone] & 0xff000000) 
+	                             | (inode->u.xiafs_i.i_zone[zone] & 0xffffff);
+	raw_inode->i_ind_zone = (raw_inode->i_ind_zone & 0xff000000)
+	                             | (inode->u.xiafs_i.i_ind_zone   & 0xffffff);
+	raw_inode->i_dind_zone = (raw_inode->i_dind_zone & 0xff000000)
+	                             | (inode->u.xiafs_i.i_dind_zone  & 0xffffff);
     }
     inode->i_dirt=0;
     bh->b_dirt=1;

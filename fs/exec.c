@@ -460,7 +460,7 @@ restart_interp:
 	}
 	i = inode->i_mode;
 	if (IS_NOSUID(inode) && (((i & S_ISUID) && inode->i_uid != current->
-	    euid) || ((i & S_ISGID) && inode->i_gid != current->egid)) &&
+	    euid) || ((i & S_ISGID) && !in_group_p(inode->i_gid))) &&
 	    !suser()) {
 		retval = -EPERM;
 		goto exec_error2;
@@ -550,7 +550,7 @@ restart_interp:
 		p = copy_strings(1, &i_name, page, p, 2);
 		argc++;
 		if (!p) {
-			retval = -ENOMEM;
+			retval = -E2BIG;
 			goto exec_error1;
 		}
 		/*
@@ -578,7 +578,7 @@ restart_interp:
 		p = copy_strings(envc,envp,page,p,0);
 		p = copy_strings(argc,argv,page,p,0);
 		if (!p) {
-			retval = -ENOMEM;
+			retval = -E2BIG;
 			goto exec_error2;
 		}
 	}

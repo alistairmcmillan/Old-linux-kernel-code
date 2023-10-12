@@ -243,6 +243,8 @@ void do_tty_hangup(struct tty_struct * tty, struct file_operations *fops)
 			continue;
 		if (filp->f_rdev != dev)
 			continue;
+		if (filp->f_inode && filp->f_inode->i_rdev == 0x0400)
+			continue;
 		if (filp->f_op != &tty_fops)
 			continue;
 		filp->f_op = fops;
@@ -1060,6 +1062,7 @@ static void release_dev(int dev, struct file * filp)
 {
 	struct tty_struct *tty, *o_tty;
 	struct termios *tp, *o_tp;
+	struct task_struct **p;
 
 	tty = tty_table[dev];
 	tp = tty_termios[dev];
@@ -1106,6 +1109,15 @@ static void release_dev(int dev, struct file * filp)
 	}
 	if (tty->count)
 		return;
+
+	/*
+	 * Make sure there aren't any processes that still think this
+	 * tty is their controlling tty.
+	 */
+	for (p = &LAST_TASK ; p > &FIRST_TASK ; --p) {
+		if ((*p) && (*p)->tty == tty->line)
+		(*p)->tty = -1;
+	}
 
 	if (ldiscs[tty->disc].close != NULL)
 		ldiscs[tty->disc].close(tty);

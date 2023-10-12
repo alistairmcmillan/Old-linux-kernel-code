@@ -20,9 +20,9 @@
 int sys_close(int fd);
 int getrusage(struct task_struct *, int, struct rusage *);
 
-int send_sig(long sig,struct task_struct * p,int priv)
+int send_sig(unsigned long sig,struct task_struct * p,int priv)
 {
-	if (!p || (sig < 0) || (sig > 32))
+	if (!p || sig > 32)
 		return -EINVAL;
 	if (!priv && ((sig != SIGCONT) || (current->session != p->session)) &&
 	    (current->euid != p->euid) && (current->uid != p->uid) && !suser())
@@ -98,7 +98,7 @@ int bad_task_ptr(struct task_struct *p)
  * This routine scans the pid tree and make sure the rep invarient still
  * holds.  Used for debugging only, since it's very slow....
  *
- * It looks a lot scarier than it really is.... we're doing ænothing more
+ * It looks a lot scarier than it really is.... we're doing nothing more
  * than verifying the doubly-linked list found in p_ysptr and p_osptr, 
  * and checking it corresponds with the process tree defined by p_cptr and 
  * p_pptr;
