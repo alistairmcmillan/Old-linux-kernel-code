@@ -10,6 +10,12 @@
  * Authors:	Ross Biro, <bir7@leland.Stanford.Edu>
  *		Fred N. van Kempen, <waltje@uWalt.NL.Mugnet.ORG>
  *
+ * Fixes:
+ *		Alan Cox	:	Verify area fixes.
+ *		Alan Cox	:	cli() protects routing changes
+ *		Rui Oliveira	:	ICMP routing table updates
+ *		(rco@di.uminho.pt)	Routing table insertion and update
+ *
  *		This program is free software; you can redistribute it and/or
  *		modify it under the terms of the GNU General Public License
  *		as published by the Free Software Foundation; either version
@@ -46,11 +52,11 @@ rt_print(struct rtable *rt)
 {
   if (rt == NULL || inet_debug != DBG_RT) return;
 
-  printk("RT: %06lx NXT=%06lx FLAGS=0x%02lx\n",
+  printk("RT: %06lx NXT=%06lx FLAGS=0x%02x\n",
 		(long) rt, (long) rt->rt_next, rt->rt_flags);
   printk("    TARGET=%s ", in_ntoa(rt->rt_dst));
   printk("GW=%s ", in_ntoa(rt->rt_gateway));
-  printk("    DEV=%s USE=%ld REF=%ld\n",
+  printk("    DEV=%s USE=%ld REF=%d\n",
 	(rt->rt_dev == NULL) ? "NONE" : rt->rt_dev->name,
 	rt->rt_use, rt->rt_refcnt);
 }
@@ -61,9 +67,13 @@ static void
 rt_del(unsigned long dst)
 {
   struct rtable *r, *x, *p;
-
+  unsigned long flags;
+  
   DPRINTF((DBG_RT, "RT: flushing for dst %s\n", in_ntoa(dst)));
   if ((r = rt_base) == NULL) return;
+
+  save_flags(flags);
+  cli();
   p = NULL;
   while(r != NULL) {
 	if (r->rt_dst == dst) {
@@ -77,6 +87,7 @@ rt_del(unsigned long dst)
 		r = r->rt_next;
 	}
   }
+  restore_flags(flags);
 }
 
 
@@ -85,9 +96,14 @@ void
 rt_flush(struct device *dev)
 {
   struct rtable *r, *x, *p;
-
+  unsigned long flags;
+  
   DPRINTF((DBG_RT, "RT: flushing for dev 0x%08lx (%s)\n", (long)dev, dev->name));
   if ((r = rt_base) == NULL) return;
+  
+  cli();
+  save_flags(flags);
+  
   p = NULL;
   while(r != NULL) {
 	if (r->rt_dev == dev) {
@@ -101,6 +117,7 @@ rt_flush(struct device *dev)
 		r = r->rt_next;
 	}
   }
+  restore_flags(flags);
 }
 
 
@@ -110,6 +127,7 @@ rt_add(short flags, unsigned long dst, unsigned long gw, struct device *dev)
   struct rtable *r, *r1;
   struct rtable *rt;
   int mask;
+  unsigned long cpuflags;
 
   /* Allocate an entry. */
   rt = (struct rtable *) kmalloc(sizeof(struct rtable), GFP_ATOMIC);
@@ -133,8 +151,15 @@ rt_add(short flags, unsigned long dst, unsigned long gw, struct device *dev)
   if (flags & RTF_DYNAMIC) {
 	if (flags & RTF_HOST)
 		rt->rt_dst = dst;
-	else
+	else{
 		rt->rt_dst = (dst & dev->pa_mask);
+		/* We don't want new routes to our own net*/
+		if(rt->rt_dst == (dev->pa_addr & dev->pa_mask)){
+			kfree_s(rt, sizeof(struct rtable));
+			/*printk("Dynamic route to my own net rejected\n");*/
+			return;
+		}
+	}
   } else rt->rt_dst = dst;
 
   rt_print(rt);
@@ -150,13 +175,17 @@ rt_add(short flags, unsigned long dst, unsigned long gw, struct device *dev)
    * found the first address which has the same generality
    * as the one in rt.  Then we can put rt in after it.
    */
-  for (mask = 0xff000000; mask != 0xffffffff; mask = (mask >> 8) | mask) {
+  for (mask = 0xff000000L; mask != 0xffffffffL; mask = (mask >> 8) | mask) {
 	if (mask & dst) {
 		mask = mask << 8;
 		break;
 	}
   }
   DPRINTF((DBG_RT, "RT: mask = %X\n", mask));
+  
+  save_flags(cpuflags);
+  cli();
+  
   r1 = rt_base;
 
   /* See if we are getting a duplicate. */
@@ -170,19 +199,26 @@ rt_add(short flags, unsigned long dst, unsigned long gw, struct device *dev)
 			r1->rt_next = rt;
 		}
 		kfree_s(r, sizeof(struct rtable));
+		restore_flags(cpuflags);
 		return;
 	}
+	r1 = r;
+  }
 
+  r1 = rt_base;
+  for (r = rt_base; r != NULL; r = r->rt_next) {
 	if (! (r->rt_dst & mask)) {
 		DPRINTF((DBG_RT, "RT: adding before r=%X\n", r));
 		rt_print(r);
 		if (r == rt_base) {
 			rt->rt_next = rt_base;
 			rt_base = rt;
+			restore_flags(cpuflags);
 			return;
 		}
 		rt->rt_next = r;
 		r1->rt_next = rt;
+		restore_flags(cpuflags);
 		return;
 	}
 	r1 = r;
@@ -267,7 +303,7 @@ rt_get_info(char *buffer)
   
   /* This isn't quite right -- r->rt_dst is a struct! */
   for (r = rt_base; r != NULL; r = r->rt_next) {
-        pos += sprintf(pos, "%s\t%08X\t%08X\t%02X\t%d\t%d\t%d\n",
+        pos += sprintf(pos, "%s\t%08lX\t%08lX\t%02X\t%d\t%lu\t%d\n",
 		r->rt_dev->name, r->rt_dst, r->rt_gateway,
 		r->rt_flags, r->rt_refcnt, r->rt_use, r->rt_metric);
   }
@@ -327,6 +363,7 @@ rt_ioctl(unsigned int cmd, void *arg)
   struct rtentry rt;
   char namebuf[32];
   int ret;
+  int err;
 
   switch(cmd) {
 	case DDIOCSDBG:
@@ -335,10 +372,14 @@ rt_ioctl(unsigned int cmd, void *arg)
 	case SIOCADDRT:
 	case SIOCDELRT:
 		if (!suser()) return(-EPERM);
-		verify_area(VERIFY_WRITE, arg, sizeof(struct rtentry));
+		err=verify_area(VERIFY_READ, arg, sizeof(struct rtentry));
+		if(err)
+			return err;
 		memcpy_fromfs(&rt, arg, sizeof(struct rtentry));
 		if (rt.rt_dev) {
-		    verify_area(VERIFY_WRITE, rt.rt_dev, sizeof namebuf);
+		    err=verify_area(VERIFY_READ, rt.rt_dev, sizeof namebuf);
+		    if(err)
+		    	return err;
 		    memcpy_fromfs(&namebuf, rt.rt_dev, sizeof namebuf);
 		    dev = dev_get(namebuf);
 		    rt.rt_dev = dev;

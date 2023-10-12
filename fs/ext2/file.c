@@ -15,15 +15,16 @@
 #include <asm/segment.h>
 #include <asm/system.h>
 
-#include <linux/sched.h>
-#include <linux/ext2_fs.h>
-#include <linux/kernel.h>
 #include <linux/errno.h>
+#include <linux/fs.h>
+#include <linux/ext2_fs.h>
 #include <linux/fcntl.h>
+#include <linux/kernel.h>
+#include <linux/sched.h>
 #include <linux/stat.h>
 #include <linux/locks.h>
 
-#define	NBUF	16
+#define	NBUF	32
 
 #define MIN(a,b) (((a)<(b))?(a):(b))
 #define MAX(a,b) (((a)>(b))?(a):(b))
@@ -88,7 +89,8 @@ struct inode_operations ext2_file_inode_operations = {
 	}
 	sb = inode->i_sb;
 	if (!S_ISREG(inode->i_mode) && !S_ISDIR(inode->i_mode)) {
-		printk ("ext2_file_read: mode = %07o\n", inode->i_mode);
+		ext2_warning (sb, "ext2_file_read", "mode = %07o",
+			      inode->i_mode);
 		return -EINVAL;
 	}
 	offset = filp->f_pos;
@@ -216,7 +218,8 @@ static int ext2_file_write (struct inode * inode, struct file * filp,
 	}
 	sb = inode->i_sb;
 	if (!S_ISREG(inode->i_mode)) {
-		printk ("ext2_file_write: mode = %07o\n", inode->i_mode);
+		ext2_warning (sb, "ext2_file_write", "mode = %07o\n",
+			      inode->i_mode);
 		return -EINVAL;
 	}
 /*
@@ -261,8 +264,7 @@ static int ext2_file_write (struct inode * inode, struct file * filp,
 		bh->b_dirt = 1;
 		brelse (bh);
 	}
-	inode->i_mtime = CURRENT_TIME;
-	inode->i_ctime = CURRENT_TIME;
+	inode->i_ctime = inode->i_mtime = CURRENT_TIME;
 	filp->f_pos = pos;
 	inode->i_dirt = 1;
 	return written;

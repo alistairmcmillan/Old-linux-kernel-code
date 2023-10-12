@@ -42,6 +42,11 @@ extern struct kbd_struct kbd_table[];
 #define VC_CRLF		8	/* 0 - enter sends CR, 1 - enter sends CRLF */
 #define VC_META		9	/* 0 - meta, 1 - meta=prefix with ESC */
 #define VC_PAUSE	10	/* pause key pressed */
+#define VC_MEDIUMRAW	11	/* medium raw (keycode) mode */
+#define VC_SHIFTLOCK	12	/* shift lock mode */
+#define VC_ALTGRLOCK	13	/* altgr lock mode */
+#define VC_CTRLLOCK	14	/* control lock mode */
+#define VC_ALTLOCK	15	/* alt lock mode */
 
 #define LED_MASK	7
 
@@ -108,6 +113,7 @@ extern char *func_table[NR_FUNC];
 #define KT_SHIFT	7
 #define KT_META		8
 #define KT_ASCII	9
+#define KT_LOCK		10
 
 #define K(t,v)		(((t)<<8)|(v))
 #define KTYP(x)		((x) >> 8)
@@ -194,7 +200,7 @@ extern char *func_table[NR_FUNC];
 #define K_ALT		K(KT_SHIFT,KG_ALT)
 #define K_ALTGR		K(KT_SHIFT,KG_ALTGR)
 
-#define NR_SHIFT	16
+#define NR_SHIFT	4
 
 #define K_CAPSSHIFT	K(KT_SHIFT,NR_SHIFT)
 
@@ -208,5 +214,10 @@ extern char *func_table[NR_FUNC];
 #define K_ASC7		K(KT_ASCII,7)
 #define K_ASC8		K(KT_ASCII,8)
 #define K_ASC9		K(KT_ASCII,9)
+
+#define K_SHIFTLOCK	K(KT_LOCK,0)
+#define K_CTRLLOCK	K(KT_LOCK,2)
+#define K_ALTLOCK	K(KT_LOCK,3)
+#define K_ALTGRLOCK	K(KT_LOCK,1)
 
 #endif

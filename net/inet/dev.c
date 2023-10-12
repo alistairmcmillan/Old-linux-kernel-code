@@ -10,6 +10,17 @@
  * Authors:	Ross Biro, <bir7@leland.Stanford.Edu>
  *		Fred N. van Kempen, <waltje@uWalt.NL.Mugnet.ORG>
  *		Mark Evans, <evansmp@uhura.aston.ac.uk>
+ * 
+ * Fixes:	
+ *		Alan Cox:	check_addr returns a value for a wrong subnet
+ *				ie not us but don't forward this!
+ *		Alan Cox:	block timer if the inet_bh handler is running
+ *		Alan Cox:	generic queue code added. A lot neater now
+ *		C.E.Hawkins:	SIOCGIFCONF only reports 'upped' interfaces
+ *		C.E.Hawkins:	IFF_PROMISC support
+ *		Alan Cox:	Supports Donald Beckers new hardware 
+ *				multicast layer, but not yet multicast lists.
+ *		Alan Cox:	ip_addr_match problems with class A/B nets.
  *
  *		This program is free software; you can redistribute it and/or
  *		modify it under the terms of the GNU General Public License
@@ -81,12 +92,16 @@ get_mask(unsigned long addr)
 {
   unsigned long dst;
 
-  if (addr == 0) return(0);	/* special case */
+  if (addr == 0L) 
+  	return(0L);	/* special case */
 
   dst = ntohl(addr);
-  if (IN_CLASSA(dst)) return(htonl(IN_CLASSA_NET));
-  if (IN_CLASSB(dst)) return(htonl(IN_CLASSB_NET));
-  if (IN_CLASSC(dst)) return(htonl(IN_CLASSC_NET));
+  if (IN_CLASSA(dst)) 
+  	return(htonl(IN_CLASSA_NET));
+  if (IN_CLASSB(dst)) 
+  	return(htonl(IN_CLASSB_NET));
+  if (IN_CLASSC(dst)) 
+  	return(htonl(IN_CLASSC_NET));
   
   /* Something else, probably a subnet. */
   return(0);
@@ -97,18 +112,19 @@ int
 ip_addr_match(unsigned long me, unsigned long him)
 {
   int i;
-
+  unsigned long mask=0xFFFFFFFF;
   DPRINTF((DBG_DEV, "ip_addr_match(%s, ", in_ntoa(me)));
   DPRINTF((DBG_DEV, "%s)\n", in_ntoa(him)));
 
-  if (me == him) return(1);
-  for (i = 0; i < 4; i++, me >>= 8, him >>= 8) {
+  if (me == him) 
+  	return(1);
+  for (i = 0; i < 4; i++, me >>= 8, him >>= 8, mask >>= 8) {
 	if ((me & 0xFF) != (him & 0xFF)) {
 		/*
 		 * The only way this could be a match is for
 		 * the rest of addr1 to be 0 or 255.
 		 */
-		if (me != 0 && me != 255) return(0);
+		if (me != 0 && me != mask) return(0);
 		return(1);
 	}
   }
@@ -133,7 +149,7 @@ chk_addr(unsigned long addr)
   }
 
   /* Accept all of the `loopback' class A net. */
-  if ((dst & IN_CLASSA_NET) == 0x7F000000) {
+  if ((dst & IN_CLASSA_NET) == 0x7F000000L) {
 	DPRINTF((DBG_DEV, "LOOPBACK\n"));
 
 	/*
@@ -145,7 +161,13 @@ chk_addr(unsigned long addr)
 
   /* OK, now check the interface addresses. */
   for (dev = dev_base; dev != NULL; dev = dev->next) {
-	if (dev->pa_addr == 0) continue;
+	if (dev->pa_addr == 0)
+	{
+		if(dev->flags&IFF_PROMISC)	/* This allows all addresses through */
+			return(IS_MYADDR);
+		else
+			continue;
+	}
 
 	/* Is it the exact IP address? */
 	if (addr == dev->pa_addr) {
@@ -168,6 +190,12 @@ chk_addr(unsigned long addr)
   }
 
   DPRINTF((DBG_DEV, "NONE\n"));
+  
+  if ((addr & 0xFF) == 0xFF)
+  {
+  	/* Wrong subnetted IS_BROADCAST */
+  	return(IS_INVBCAST);
+  }
   return(0);		/* no match at all */
 }
 
@@ -226,7 +254,8 @@ dev_remove_pack(struct packet_type *pt)
   for (pt1 = ptype_base; pt1->next != NULL; pt1 = pt1->next) {
 	if (pt1->next == pt ) {
 		cli();
-		if (!pt->copy && lpt) lpt->copy = 0;
+		if (!pt->copy && lpt) 
+			lpt->copy = 0;
 		pt1->next = pt->next;
 		sti();
 		return;
@@ -246,7 +275,8 @@ dev_get(char *name)
   struct device *dev;
 
   for (dev = dev_base; dev != NULL; dev = dev->next) {
-	if (strcmp(dev->name, name) == 0) return(dev);
+	if (strcmp(dev->name, name) == 0) 
+		return(dev);
   }
   return(NULL);
 }
@@ -265,7 +295,7 @@ dev_check(unsigned long addr)
   for (dev = dev_base; dev; dev = dev->next)
 	if ((dev->flags & IFF_UP) && !(dev->flags & IFF_POINTOPOINT) &&
 	    (dev->flags & IFF_LOOPBACK ? (addr == dev->pa_addr) :
-	    (dev->pa_addr & addr) == (dev->pa_addr & dev->pa_mask)))
+	    (dev->pa_mask & addr) == (dev->pa_addr & dev->pa_mask)))
 		break;
   /* no need to check broadcast addresses */
   return dev;
@@ -278,8 +308,10 @@ dev_open(struct device *dev)
 {
   int ret = 0;
 
-  if (dev->open) ret = dev->open(dev);
-  if (ret == 0) dev->flags |= (IFF_UP | IFF_RUNNING);
+  if (dev->open) 
+  	ret = dev->open(dev);
+  if (ret == 0) 
+  	dev->flags |= (IFF_UP | IFF_RUNNING);
 
   return(ret);
 }
@@ -290,13 +322,24 @@ int
 dev_close(struct device *dev)
 {
   if (dev->flags != 0) {
+  	int ct=0;
 	dev->flags = 0;
-	if (dev->stop) dev->stop(dev);
+	if (dev->stop) 
+		dev->stop(dev);
 	rt_flush(dev);
 	dev->pa_addr = 0;
 	dev->pa_dstaddr = 0;
 	dev->pa_brdaddr = 0;
 	dev->pa_mask = 0;
+	/* Purge any queued packets when we down the link */
+	while(ct<DEV_NUMBUFFS)
+	{
+		struct sk_buff *skb;
+		while((skb=skb_dequeue(&dev->buffs[ct]))!=NULL)
+			if(skb->free)
+				kfree_skb(skb,FREE_WRITE);
+		ct++;
+	}
   }
 
   return(0);
@@ -307,7 +350,6 @@ dev_close(struct device *dev)
 void
 dev_queue_xmit(struct sk_buff *skb, struct device *dev, int pri)
 {
-  struct sk_buff *skb2;
   int where = 0;		/* used to say if the packet should go	*/
 				/* at the front or the back of the	*/
 				/* queue.				*/
@@ -319,7 +361,9 @@ dev_queue_xmit(struct sk_buff *skb, struct device *dev, int pri)
 	printk("dev.c: dev_queue_xmit: dev = NULL\n");
 	return;
   }
-  
+ 
+  IS_SKB(skb);
+    
   skb->dev = dev;
   if (skb->next != NULL) {
 	/* Make sure we haven't missed an interrupt. */
@@ -347,25 +391,11 @@ dev_queue_xmit(struct sk_buff *skb, struct device *dev, int pri)
 
   /* Interrupts should already be cleared by hard_start_xmit. */
   cli();
-  if (dev->buffs[pri] == NULL) {
-	dev->buffs[pri] = skb;
-	skb->next = skb;
-	skb->prev = skb;
-  } else {
-	if (where) {
-		skb->next = (struct sk_buff *) dev->buffs[pri];
-		skb->prev = (struct sk_buff *) dev->buffs[pri]->prev;
-		skb->prev->next = skb;
-		skb->next->prev = skb;
-		dev->buffs[pri] = skb;
-	} else {
-		skb2 = (struct sk_buff *) dev->buffs[pri];
-		skb->next = skb2;
-		skb->prev = skb2->prev;
-		skb->next->prev = skb;
-		skb->prev->next = skb;
-	}
-  }
+  skb->magic = DEV_QUEUE_MAGIC;
+  if(where)
+  	skb_queue_head(&dev->buffs[pri],skb);
+  else
+  	skb_queue_tail(&dev->buffs[pri],skb);
   skb->magic = DEV_QUEUE_MAGIC;
   sti();
 }
@@ -378,22 +408,12 @@ void
 netif_rx(struct sk_buff *skb)
 {
   /* Set any necessary flags. */
-  skb->lock = 0;
   skb->sk = NULL;
-
+  skb->free = 1;
+  
   /* and add it to the "backlog" queue. */
-  cli();
-  if (backlog == NULL) {
-	skb->prev = skb;
-	skb->next = skb;
-	backlog = skb;
-  } else {
-	skb->prev = (struct sk_buff *) backlog->prev;
-	skb->next = (struct sk_buff *) backlog;
-	skb->next->prev = skb;
-	skb->prev->next = skb;
-  }
-  sti();
+  IS_SKB(skb);
+  skb_queue_tail(&backlog,skb);
    
   /* If any packet arrived, mark it for processing. */
   if (backlog != NULL) mark_bh(INET_BH);
@@ -432,14 +452,13 @@ dev_rint(unsigned char *buff, long len, int flags, struct device *dev)
 	  dropping = 0;
 	}
 
-	skb = (struct sk_buff *) kmalloc(sizeof(*skb) + len, GFP_ATOMIC);
+	skb = alloc_skb(sizeof(*skb) + len, GFP_ATOMIC);
 	if (skb == NULL) {
 		printk("dev_rint: packet dropped on %s (no memory) !\n",
 		       dev->name);
 		dropping = 1;
 		return(1);
 	}
-	skb->lock = 0;
 	skb->mem_len = sizeof(*skb) + len;
 	skb->mem_addr = (struct sk_buff *) skb;
 
@@ -461,6 +480,7 @@ dev_rint(unsigned char *buff, long len, int flags, struct device *dev)
   }
   skb->len = len;
   skb->dev = dev;
+  skb->free = 1;
 
   netif_rx(skb);
   /* OK, all done. */
@@ -481,10 +501,17 @@ dev_transmit(void)
   }
 }
 
+static volatile char in_bh = 0;
+
+int in_inet_bh()	/* Used by timer.c */
+{
+	return(in_bh==0?0:1);
+}
 
 /*
  * This function gets called periodically, to see if we can
  * process any data that came in from some interface.
+ *
  */
 void
 inet_bh(void *tmp)
@@ -493,7 +520,7 @@ inet_bh(void *tmp)
   struct packet_type *ptype;
   unsigned short type;
   unsigned char flag = 0;
-  static volatile char in_bh = 0;
+
 
   /* Atomically check and mark our BUSY state. */
   if (set_bit(1, (void*)&in_bh))
@@ -503,18 +530,10 @@ inet_bh(void *tmp)
   dev_transmit();
   
   /* Any data left to process? */
-  cli();
-  while (backlog != NULL) {
-	skb = (struct sk_buff *) backlog;
-	if (skb->next == skb) {
-		backlog = NULL;
-	} else {
-		backlog = skb->next;
-		skb->next->prev = skb->prev;
-		skb->prev->next = skb->next;
-	}
+  while((skb=skb_dequeue(&backlog))!=NULL)
+  {
+	flag=0;
 	sti();
-
        /*
 	* Bump the pointer to the next structure.
 	* This assumes that the basic 'skb' pointer points to
@@ -532,6 +551,7 @@ inet_bh(void *tmp)
 	* header (the h_proto field in struct ethhdr), but drivers like
 	* SLIP and PLIP have no alternative but to force the type to be
 	* IP or something like that.  Sigh- FvK
+	* FIXME: Ethernet drivers need potty training in 802.3 packets -AC
 	*/
        type = skb->dev->type_trans(skb, skb->dev);
 
@@ -546,16 +566,17 @@ inet_bh(void *tmp)
 			struct sk_buff *skb2;
 
 			if (ptype->copy) {	/* copy if we need to	*/
-				skb2 = (struct sk_buff *) kmalloc(skb->mem_len, GFP_ATOMIC);
-				if (skb2 == NULL) continue;
+				skb2 = alloc_skb(skb->mem_len, GFP_ATOMIC);
+				if (skb2 == NULL) 
+					continue;
 				memcpy(skb2, (const void *) skb, skb->mem_len);
 				skb2->mem_addr = skb2;
-				skb2->lock = 0;
 				skb2->h.raw = (unsigned char *)(
 				    (unsigned long) skb2 +
 				    (unsigned long) skb->h.raw -
 				    (unsigned long) skb
 				);
+				skb2->free = 1;
 			} else {
 				skb2 = skb;
 			}
@@ -588,6 +609,7 @@ inet_bh(void *tmp)
   }
   in_bh = 0;
   sti();
+  dev_transmit();
 }
 
 
@@ -595,55 +617,23 @@ inet_bh(void *tmp)
  * This routine is called when an device driver (i.e. an
  * interface) is * ready to transmit a packet.
  */
-void
-dev_tint(struct device *dev)
+ 
+void dev_tint(struct device *dev)
 {
-  int i;
-  struct sk_buff *skb;
-
-  for (i = 0; i < DEV_NUMBUFFS; i++) {
-        cli();
-	while (dev->buffs[i] != NULL) {
-		skb = (struct sk_buff *) dev->buffs[i];
-		if (skb->magic != DEV_QUEUE_MAGIC) {
-			printk("INET: dev: skb with bad magic-%X:", skb->magic);
-			printk("squashing queue\n");
-			dev->buffs[i] = NULL;
-			continue;
+	int i;
+	struct sk_buff *skb;
+	
+	for(i = 0;i < DEV_NUMBUFFS; i++) {
+		while((skb=skb_dequeue(&dev->buffs[i]))!=NULL)
+		{
+			skb->magic = 0;
+			skb->next = NULL;
+			skb->prev = NULL;
+			dev->queue_xmit(skb,dev,-i - 1);
+			if (dev->tbusy)
+				return;
 		}
-
-		skb->magic = 0;
-
-		if (skb->next == skb) {
-			dev->buffs[i] = NULL;
-		} else {
-			/* Extra consistency check. */
-			if (skb->next == NULL
-#ifdef CONFIG_MAX_16M
-			    || (unsigned long)(skb->next) > 16*1024*1024
-#endif
-			) {
-				printk("INET: dev: *** bug bad skb->next,");
-				printk(", squashing queue\n");
-				dev->buffs[i] = NULL;
-			} else {
-				dev->buffs[i]= skb->next;
-				skb->prev->next = skb->next;
-				skb->next->prev = skb->prev;
-			}
-		}
-
-		skb->next = NULL;
-		skb->prev = NULL;
-		sti();
-
-		/* This will send it through the process again. */
-		dev->queue_xmit(skb, dev, -i - 1);
-		if (dev->tbusy) return;
-		cli();
 	}
-  }
-  sti();
 }
 
 
@@ -665,6 +655,8 @@ dev_ifconf(char *arg)
 
   /* Loop over the interfaces, and write an info block for each. */
   for (dev = dev_base; dev != NULL; dev = dev->next) {
+        if(!(dev->flags & IFF_UP))
+        	continue;
 	memset(&ifr, 0, sizeof(struct ifreq));
 	strcpy(ifr.ifr_name, dev->name);
 	(*(struct sockaddr_in *) &ifr.ifr_addr).sin_family = dev->family;
@@ -753,6 +745,11 @@ dev_ifsioc(void *arg, unsigned int getset)
 			IFF_UP | IFF_BROADCAST | IFF_DEBUG | IFF_LOOPBACK |
 			IFF_POINTOPOINT | IFF_NOTRAILERS | IFF_RUNNING |
 			IFF_NOARP | IFF_PROMISC | IFF_ALLMULTI);
+			
+		  if ( (old_flags & IFF_PROMISC) && ((dev->flags & IFF_PROMISC) == 0))
+		  	dev->set_multicast_list(dev,0,NULL);
+		  if ( (dev->flags & IFF_PROMISC) && ((old_flags & IFF_PROMISC) == 0))
+		  	dev->set_multicast_list(dev,-1,NULL);
 		  if ((old_flags & IFF_UP) && ((dev->flags & IFF_UP) == 0)) {
 			ret = dev_close(dev);
 		  } else
@@ -849,6 +846,11 @@ dev_ifsioc(void *arg, unsigned int getset)
 		printk("NET: ioctl(SIOCSIFMEM, 0x%08X)\n", (int)arg);
 		ret = -EINVAL;
 		break;
+	case SIOCGIFHWADDR:
+		memcpy(ifr.ifr_hwaddr,dev->dev_addr, MAX_ADDR_LEN);
+		memcpy_tofs(arg,&ifr,sizeof(struct ifreq));
+		ret=0;
+		break;
 	default:
 		ret = -EINVAL;
   }
@@ -903,12 +905,12 @@ dev_ioctl(unsigned int cmd, void *arg)
 	  if ((dev->flags & IFF_UP) == 0
 	      && (retval = dev_open(dev)) != 0)
 	      return retval;
-	  printk("%s: adding HOST route of %8.8x.\n", dev->name,
+	  printk("%s: adding HOST route of %8.8lx.\n", dev->name,
 		 htonl(ipc.paddr));
 	  rt_add(RTF_HOST, ipc.paddr, 0, dev);
 	  if (ipc.router != 0 && ipc.router != -1) {
 	      rt_add(RTF_GATEWAY, ipc.paddr, ipc.router, dev);
-	      printk("%s: adding GATEWAY route of %8.8x.\n",
+	      printk("%s: adding GATEWAY route of %8.8lx.\n",
 		     dev->name, htonl(ipc.paddr));
 
 	  }
@@ -934,6 +936,7 @@ dev_ioctl(unsigned int cmd, void *arg)
 	case SIOCSIFMTU:
 	case SIOCGIFMEM:
 	case SIOCSIFMEM:
+	case SIOCGIFHWADDR:
 		if (!suser()) return(-EPERM);
 		ret = dev_ifsioc(arg, cmd);
 		break;

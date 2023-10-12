@@ -14,6 +14,7 @@
 #include <linux/resource.h>
 #include <linux/mm.h>
 #include <linux/tty.h>
+#include <linux/malloc.h>
 
 #include <asm/segment.h>
 extern void shm_exit (void);
@@ -347,7 +348,7 @@ static void forget_original_parent(struct task_struct * father)
 	}
 }
 
-volatile void do_exit(long code)
+NORET_TYPE void do_exit(long code)
 {
 	struct task_struct *p;
 	int i;
