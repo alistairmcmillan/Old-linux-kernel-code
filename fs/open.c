@@ -210,6 +210,25 @@ asmlinkage int sys_chdir(const char * filename)
 	return (0);
 }
 
+asmlinkage int sys_fchdir(unsigned int fd)
+{
+	struct inode * inode;
+	struct file * file;
+
+	if (fd >= NR_OPEN || !(file = current->filp[fd]))
+		return -EBADF;
+	if (!(inode = file->f_inode))
+		return -ENOENT;
+	if (!S_ISDIR(inode->i_mode))
+		return -ENOTDIR;
+	if (!permission(inode,MAY_EXEC))
+		return -EACCES;
+	iput(current->pwd);
+	current->pwd = inode;
+	inode->i_count++;
+	return (0);
+}
+
 asmlinkage int sys_chroot(const char * filename)
 {
 	struct inode * inode;
@@ -244,6 +263,8 @@ asmlinkage int sys_fchmod(unsigned int fd, mode_t mode)
 		return -EPERM;
 	if (IS_RDONLY(inode))
 		return -EROFS;
+	if (mode == (mode_t) -1)
+		mode = inode->i_mode;
 	inode->i_mode = (mode & S_IALLUGO) | (inode->i_mode & ~S_IALLUGO);
 	if (!suser() && !in_group_p(inode->i_gid))
 		inode->i_mode &= ~S_ISGID;
@@ -268,6 +289,8 @@ asmlinkage int sys_chmod(const char * filename, mode_t mode)
 		iput(inode);
 		return -EROFS;
 	}
+	if (mode == (mode_t) -1)
+		mode = inode->i_mode;
 	inode->i_mode = (mode & S_IALLUGO) | (inode->i_mode & ~S_IALLUGO);
 	if (!suser() && !in_group_p(inode->i_gid))
 		inode->i_mode &= ~S_ISGID;

@@ -362,7 +362,7 @@ static void scan_scsis (void)
 			  break;
 			case TYPE_DISK:
 			case TYPE_MOD:
-			  printk("Detected scsi disk sd%d at scsi%d, id %d, lun %d\n", MAX_SD,
+			  printk("Detected scsi disk sd%c at scsi%d, id %d, lun %d\n", 'a'+MAX_SD,
 				 shpnt->host_no , dev, lun); 
 			  if(NR_SD != -1) ++MAX_SD;
 			  break;
@@ -922,8 +922,12 @@ static int check_sense (Scsi_Cmnd * SCpnt)
 		switch (SCpnt->sense_buffer[2] & 0xf)
 		{
 		case NO_SENSE:
-		case RECOVERED_ERROR:
 			return 0;
+		case RECOVERED_ERROR:
+			if (scsi_devices[SCpnt->index].type == TYPE_TAPE)
+			  return SUGGEST_IS_OK;
+			else
+			  return 0;
 
 		case ABORTED_COMMAND:
 			return SUGGEST_RETRY;	
@@ -1040,6 +1044,8 @@ static void scsi_done (Scsi_Cmnd * SCpnt)
 
 						update_timeout(SCpnt, oldto);
 						status = REDO;
+						break;
+      					case SUGGEST_IS_OK:
 						break;
 					case SUGGEST_REMAP:			
 					case SUGGEST_RETRY: 

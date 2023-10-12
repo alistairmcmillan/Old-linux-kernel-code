@@ -3,7 +3,7 @@
  |                                                                           |
  | All of the functions which transfer data between user memory and FPU_REGs.|
  |                                                                           |
- | Copyright (C) 1992,1993                                                   |
+ | Copyright (C) 1992,1993,1994                                              |
  |                       W. Metzenthen, 22 Parker St, Ormond, Vic 3163,      |
  |                       Australia.  E-mail   billm@vaxc.cc.monash.edu.au    |
  |                                                                           |
@@ -44,18 +44,19 @@ FPU_REG FPU_loaded_data;
 
 
 /* Get a long double from user memory */
-int reg_load_extended(void)
+int reg_load_extended(overrides override)
 {
   long double *s = (long double *)FPU_data_address;
   unsigned long sigl, sigh, exp;
 
-  RE_ENTRANT_CHECK_OFF
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_READ, s, 10);
   /* Use temporary variables here because FPU_loaded data is
      static and hence re-entrancy problems can arise */
   sigl = get_fs_long((unsigned long *) s);
   sigh = get_fs_long(1 + (unsigned long *) s);
   exp = get_fs_word(4 + (unsigned short *) s);
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
 
   FPU_loaded_data.tag = TW_Valid;   /* Default */
   FPU_loaded_data.sigl = sigl;
@@ -144,16 +145,17 @@ int reg_load_extended(void)
 
 
 /* Get a double from user memory */
-int reg_load_double(void)
+int reg_load_double(overrides override)
 {
   double *dfloat = (double *)FPU_data_address;
   int exp;
   unsigned m64, l64;
 
-  RE_ENTRANT_CHECK_OFF
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_READ, dfloat, 8);
   m64 = get_fs_long(1 + (unsigned long *) dfloat);
   l64 = get_fs_long((unsigned long *) dfloat);
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
 
   if (m64 & 0x80000000)
     FPU_loaded_data.sign = SIGN_NEG;
@@ -221,15 +223,16 @@ int reg_load_double(void)
 
 
 /* Get a float from user memory */
-int reg_load_single(void)
+int reg_load_single(overrides override)
 {
   float *single = (float *)FPU_data_address;
   unsigned m32;
   int exp;
 
-  RE_ENTRANT_CHECK_OFF
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_READ, single, 4);
   m32 = get_fs_long((unsigned long *) single);
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
 
   if (m32 & 0x80000000)
     FPU_loaded_data.sign = SIGN_NEG;
@@ -289,16 +292,17 @@ int reg_load_single(void)
 
 
 /* Get a long long from user memory */
-void reg_load_int64(void)
+void reg_load_int64(overrides override)
 {
   long long *_s = (long long *)FPU_data_address;
   int e;
   long long s;
 
-  RE_ENTRANT_CHECK_OFF
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_READ, _s, 8);
   ((unsigned long *)&s)[0] = get_fs_long((unsigned long *) _s);
   ((unsigned long *)&s)[1] = get_fs_long(1 + (unsigned long *) _s);
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
 
   if (s == 0)
     { reg_move(&CONST_Z, &FPU_loaded_data); return; }
@@ -320,15 +324,16 @@ void reg_load_int64(void)
 
 
 /* Get a long from user memory */
-void reg_load_int32(void)
+void reg_load_int32(overrides override)
 {
   long *_s = (long *)FPU_data_address;
   long s;
   int e;
 
-  RE_ENTRANT_CHECK_OFF
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_READ, _s, 4);
   s = (long)get_fs_long((unsigned long *) _s);
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
 
   if (s == 0)
     { reg_move(&CONST_Z, &FPU_loaded_data); return; }
@@ -351,15 +356,16 @@ void reg_load_int32(void)
 
 
 /* Get a short from user memory */
-void reg_load_int16(void)
+void reg_load_int16(overrides override)
 {
   short *_s = (short *)FPU_data_address;
   int s, e;
 
-  RE_ENTRANT_CHECK_OFF
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_READ, _s, 2);
   /* Cast as short to get the sign extended. */
   s = (short)get_fs_word((unsigned short *) _s);
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
 
   if (s == 0)
     { reg_move(&CONST_Z, &FPU_loaded_data); return; }
@@ -383,19 +389,22 @@ void reg_load_int16(void)
 
 
 /* Get a packed bcd array from user memory */
-void reg_load_bcd(void)
+void reg_load_bcd(overrides override)
 {
   char *s = (char *)FPU_data_address;
   int pos;
   unsigned char bcd;
   long long l=0;
 
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_READ, s, 10);
+  RE_ENTRANT_CHECK_ON;
   for ( pos = 8; pos >= 0; pos--)
     {
       l *= 10;
-      RE_ENTRANT_CHECK_OFF
+      RE_ENTRANT_CHECK_OFF;
       bcd = (unsigned char)get_fs_byte((unsigned char *) s+pos);
-      RE_ENTRANT_CHECK_ON
+      RE_ENTRANT_CHECK_ON;
       l += bcd >> 4;
       l *= 10;
       l += bcd & 0x0f;
@@ -403,11 +412,11 @@ void reg_load_bcd(void)
   
   /* Finish all access to user memory before putting stuff into
      the static FPU_loaded_data */
-  RE_ENTRANT_CHECK_OFF
+  RE_ENTRANT_CHECK_OFF;
   FPU_loaded_data.sign =
     ((unsigned char)get_fs_byte((unsigned char *) s+9)) & 0x80 ?
       SIGN_NEG : SIGN_POS;
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
 
   if (l == 0)
     {
@@ -427,7 +436,7 @@ void reg_load_bcd(void)
 /*===========================================================================*/
 
 /* Put a long double into user memory */
-int reg_store_extended(void)
+int reg_store_extended(overrides override)
 {
   /*
     The only exception raised by an attempt to store to an
@@ -438,7 +447,9 @@ int reg_store_extended(void)
 
   if ( FPU_st0_tag != TW_Empty )
     {
-      verify_area(VERIFY_WRITE, d, 10);
+      RE_ENTRANT_CHECK_OFF;
+      FPU_verify_area(VERIFY_WRITE, d, 10);
+      RE_ENTRANT_CHECK_ON;
       write_to_extended(FPU_st0_ptr, (char *) FPU_data_address);
       return 1;
     }
@@ -450,7 +461,7 @@ int reg_store_extended(void)
       /* The masked response */
       /* Put out the QNaN indefinite */
       RE_ENTRANT_CHECK_OFF;
-      verify_area(VERIFY_WRITE,d,10);
+      FPU_verify_area(VERIFY_WRITE,d,10);
       put_fs_long(0, (unsigned long *) d);
       put_fs_long(0xc0000000, 1 + (unsigned long *) d);
       put_fs_word(0xffff, 4 + (short *) d);
@@ -464,7 +475,7 @@ int reg_store_extended(void)
 
 
 /* Put a double into user memory */
-int reg_store_double(void)
+int reg_store_double(overrides override)
 {
   double *dfloat = (double *)FPU_data_address;
   unsigned long l[2];
@@ -635,11 +646,11 @@ int reg_store_double(void)
 	{
 	  /* The masked response */
 	  /* Put out the QNaN indefinite */
-	  RE_ENTRANT_CHECK_OFF
-	  verify_area(VERIFY_WRITE,(void *)dfloat,8);
+	  RE_ENTRANT_CHECK_OFF;
+	  FPU_verify_area(VERIFY_WRITE,(void *)dfloat,8);
 	  put_fs_long(0, (unsigned long *) dfloat);
 	  put_fs_long(0xfff80000, 1 + (unsigned long *) dfloat);
-	  RE_ENTRANT_CHECK_ON
+	  RE_ENTRANT_CHECK_ON;
 	  return 1;
 	}
       else
@@ -648,18 +659,18 @@ int reg_store_double(void)
   if (FPU_st0_ptr->sign)
     l[1] |= 0x80000000;
 
-  RE_ENTRANT_CHECK_OFF
-  verify_area(VERIFY_WRITE,(void *)dfloat,8);
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_WRITE,(void *)dfloat,8);
   put_fs_long(l[0], (unsigned long *)dfloat);
   put_fs_long(l[1], 1 + (unsigned long *)dfloat);
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
 
   return 1;
 }
 
 
 /* Put a float into user memory */
-int reg_store_single(void)
+int reg_store_single(overrides override)
 {
   float *single = (float *)FPU_data_address;
   long templ;
@@ -819,10 +830,10 @@ int reg_store_single(void)
 	{
 	  /* The masked response */
 	  /* Put out the QNaN indefinite */
-	  RE_ENTRANT_CHECK_OFF
-	  verify_area(VERIFY_WRITE,(void *)single,4);
+	  RE_ENTRANT_CHECK_OFF;
+	  FPU_verify_area(VERIFY_WRITE,(void *)single,4);
 	  put_fs_long(0xffc00000, (unsigned long *) single);
-	  RE_ENTRANT_CHECK_ON
+	  RE_ENTRANT_CHECK_ON;
 	  return 1;
 	}
       else
@@ -838,17 +849,17 @@ int reg_store_single(void)
   if (FPU_st0_ptr->sign)
     templ |= 0x80000000;
 
-  RE_ENTRANT_CHECK_OFF
-  verify_area(VERIFY_WRITE,(void *)single,4);
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_WRITE,(void *)single,4);
   put_fs_long(templ,(unsigned long *) single);
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
 
   return 1;
 }
 
 
 /* Put a long long into user memory */
-int reg_store_int64(void)
+int reg_store_int64(overrides override)
 {
   long long *d = (long long *)FPU_data_address;
   FPU_REG t;
@@ -896,18 +907,18 @@ int reg_store_int64(void)
 	tll = - tll;
     }
 
-  RE_ENTRANT_CHECK_OFF
-  verify_area(VERIFY_WRITE,(void *)d,8);
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_WRITE,(void *)d,8);
   put_fs_long(((long *)&tll)[0],(unsigned long *) d);
   put_fs_long(((long *)&tll)[1],1 + (unsigned long *) d);
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
 
   return 1;
 }
 
 
 /* Put a long into user memory */
-int reg_store_int32(void)
+int reg_store_int32(overrides override)
 {
   long *d = (long *)FPU_data_address;
   FPU_REG t;
@@ -951,17 +962,17 @@ int reg_store_int32(void)
 	t.sigl = -(long)t.sigl;
     }
 
-  RE_ENTRANT_CHECK_OFF
-  verify_area(VERIFY_WRITE,d,4);
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_WRITE,d,4);
   put_fs_long(t.sigl, (unsigned long *) d);
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
 
   return 1;
 }
 
 
 /* Put a short into user memory */
-int reg_store_int16(void)
+int reg_store_int16(overrides override)
 {
   short *d = (short *)FPU_data_address;
   FPU_REG t;
@@ -1005,17 +1016,17 @@ int reg_store_int16(void)
 	t.sigl = -t.sigl;
     }
 
-  RE_ENTRANT_CHECK_OFF
-  verify_area(VERIFY_WRITE,d,2);
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_WRITE,d,2);
   put_fs_word((short)t.sigl,(short *) d);
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
 
   return 1;
 }
 
 
 /* Put a packed bcd array into user memory */
-int reg_store_bcd(void)
+int reg_store_bcd(overrides override)
 {
   char *d = (char *)FPU_data_address;
   FPU_REG t;
@@ -1045,14 +1056,14 @@ int reg_store_bcd(void)
       if ( control_word & CW_Invalid )
 	{
 	  /* Produce the QNaN "indefinite" */
-	  RE_ENTRANT_CHECK_OFF
-	  verify_area(VERIFY_WRITE,d,10);
+	  RE_ENTRANT_CHECK_OFF;
+	  FPU_verify_area(VERIFY_WRITE,d,10);
 	  for ( i = 0; i < 7; i++)
 	    put_fs_byte(0, (unsigned char *) d+i); /* These bytes "undefined" */
 	  put_fs_byte(0xc0, (unsigned char *) d+7); /* This byte "undefined" */
 	  put_fs_byte(0xff, (unsigned char *) d+8);
 	  put_fs_byte(0xff, (unsigned char *) d+9);
-	  RE_ENTRANT_CHECK_ON
+	  RE_ENTRANT_CHECK_ON;
 	  return 1;
 	}
       else
@@ -1064,18 +1075,20 @@ int reg_store_bcd(void)
       set_precision_flag(precision_loss);
     }
 
-  verify_area(VERIFY_WRITE,d,10);
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_WRITE,d,10);
+  RE_ENTRANT_CHECK_ON;
   for ( i = 0; i < 9; i++)
     {
       b = div_small(&ll, 10);
       b |= (div_small(&ll, 10)) << 4;
-      RE_ENTRANT_CHECK_OFF
+      RE_ENTRANT_CHECK_OFF;
       put_fs_byte(b,(unsigned char *) d+i);
-      RE_ENTRANT_CHECK_ON
+      RE_ENTRANT_CHECK_ON;
     }
-  RE_ENTRANT_CHECK_OFF
+  RE_ENTRANT_CHECK_OFF;
   put_fs_byte(sign,(unsigned char *) d+9);
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
 
   return 1;
 }
@@ -1157,7 +1170,8 @@ char *fldenv(void)
   unsigned char tag;
   int i;
 
-  RE_ENTRANT_CHECK_OFF
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_READ, s, 0x1c);
   control_word = get_fs_word((unsigned short *) s);
   partial_status = get_fs_word((unsigned short *) (s+4));
   tag_word = get_fs_word((unsigned short *) (s+8));
@@ -1165,7 +1179,7 @@ char *fldenv(void)
   cs_selector = get_fs_long((unsigned long *) (s+0x10));
   data_operand_offset = get_fs_long((unsigned long *) (s+0x14));
   operand_selector = get_fs_long((unsigned long *) (s+0x18));
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
 
   top = (partial_status >> SW_Top_Shift) & 7;
 
@@ -1226,7 +1240,7 @@ void frstor(void)
     {
       /* Load each register. */
       FPU_data_address = (void *)(s+i*10);
-      reg_load_extended();
+      reg_load_extended((overrides){0,0});
       stnr = (i+top) & 7;
       tag = regs[stnr].tag;   /* Derived from the loaded tag word. */
       reg_move(&FPU_loaded_data, &regs[stnr]);
@@ -1275,9 +1289,8 @@ char *fstenv(void)
 {
   char *d = (char *)FPU_data_address;
 
-  verify_area(VERIFY_WRITE,d,28);
-
-  RE_ENTRANT_CHECK_OFF
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_WRITE,d,28);
 #ifdef PECULIAR_486
   /* An 80486 sets all the reserved bits to 1. */
   put_fs_long(0xffff0040 | (control_word & ~0xe080), (unsigned long *) d);
@@ -1297,7 +1310,7 @@ char *fstenv(void)
 #else
   put_fs_long(operand_selector, (unsigned long *) (d+0x18));
 #endif PECULIAR_486
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
   
   control_word |= CW_Exceptions;
   partial_status &= ~(SW_Summary | SW_Backward);
@@ -1312,7 +1325,9 @@ void fsave(void)
   int i;
 
   d = fstenv();
-  verify_area(VERIFY_WRITE,d,80);
+  RE_ENTRANT_CHECK_OFF;
+  FPU_verify_area(VERIFY_WRITE,d,80);
+  RE_ENTRANT_CHECK_ON;
   for ( i = 0; i < 8; i++ )
     write_to_extended(&regs[(top + i) & 7], d + 10 * i);
 
@@ -1324,7 +1339,7 @@ void fsave(void)
 
 /*
   A call to this function must be preceeded by a call to
-  verify_area() to verify access to the 10 bytes at d
+  FPU_verify_area() to verify access to the 10 bytes at d
   */
 static void write_to_extended(FPU_REG *rp, char *d)
 {

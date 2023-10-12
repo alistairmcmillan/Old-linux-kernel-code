@@ -47,6 +47,18 @@
  *	Michael O'Reilly	:	ack < copied bug fix.
  *	Johannes Stille		:	Misc tcp fixes (not all in yet).
  *		Alan Cox	:	FIN with no memory -> CRASH
+ *		Alan Cox	:	Added socket option proto entries. Also added awareness of them to accept.
+ *		Alan Cox	:	Added TCP options (SOL_TCP)
+ *		Alan Cox	:	Switched wakeup calls to callbacks, so the kernel can layer network sockets.
+ *		Alan Cox	:	Use ip_tos/ip_ttl settings.
+ *		Alan Cox	:	Handle FIN (more) properly (we hope).
+ *		Alan Cox	:	RST frames sent on unsynchronised state ack error/
+ *		Alan Cox	:	Put in missing check for SYN bit.
+ *		Alan Cox	:	Added tcp_select_window() aka NET2E 
+ *					window non shrink trick.
+ *		Alan Cox	:	Added a couple of small NET2E timer fixes
+ *		Charles Hedrick :	TCP fixes
+ *		Toomas Tamm	:	TCP window fixes
  *
  *
  * To Fix:
@@ -54,7 +66,6 @@
  *		it causes a select. Linux can - given the official select semantics I
  *		feel that _really_ its the BSD network programs that are bust (notably
  *		inetd, which hangs occasionally because of this).
- *			Proper processing of piggybacked data on connect.
  *			Add VJ Fastrecovery algorithm ?
  *			Protocol closedown badly messed up.
  *			Incompatiblity with spider ports (tcp hangs on that 
@@ -92,6 +103,7 @@
 
 #define SEQ_TICK 3
 unsigned long seq_offset;
+#define SUBNETSARELOCAL
 
 static __inline__ int 
 min(unsigned int a, unsigned int b)
@@ -147,6 +159,39 @@ diff(unsigned long seq1, unsigned long seq2)
   return(~d+1);
 }
 
+/* This routine picks a TCP windows for a socket based on
+   the following constraints
+   
+   1. The window can never be shrunk once it is offered (RFC 793)
+   2. We limit memory per socket
+   
+   For now we use NET2E3's heuristic of offering half the memory
+   we have handy. All is not as bad as this seems however because
+   of two things. Firstly we will bin packets even within the window
+   in order to get the data we are waiting for into the memory limit.
+   Secondly we bin common duplicate forms at receive time
+
+   Better heuristics welcome
+*/
+   
+static int tcp_select_window(struct sock *sk)
+{
+	int new_window = sk->prot->rspace(sk);
+
+/*
+ * two things are going on here.  First, we don't ever offer a
+ * window less than min(sk->mss, MAX_WINDOW/2).  This is the
+ * receiver side of SWS as specified in RFC1122.
+ * Second, we always give them at least the window they
+ * had before, in order to avoid retracting window.  This
+ * is technically allowed, but RFC1122 advises against it and
+ * in practice it causes trouble.
+ */
+	if (new_window < min(sk->mss, MAX_WINDOW/2) ||
+	    new_window < sk->window)
+	  return(sk->window);
+	return(new_window);
+}
 
 /* Enter the time wait state. */
 
@@ -155,7 +200,7 @@ static void tcp_time_wait(struct sock *sk)
   sk->state = TCP_TIME_WAIT;
   sk->shutdown = SHUTDOWN_MASK;
   if (!sk->dead)
-	wake_up(sk->sleep);
+	sk->state_change(sk);
   reset_timer(sk, TIME_CLOSE, TCP_TIMEWAIT_LEN);
 }
 
@@ -174,11 +219,13 @@ tcp_retransmit(struct sock *sk, int all)
 	return;
   }
 
-  if (sk->cong_window > 4)
-       sk->cong_window = sk->cong_window / 2;
-  sk->exp_growth = 0;
+  sk->ssthresh = sk->cong_window >> 1; /* remember window where we lost */
+  /* sk->ssthresh in theory can be zero.  I guess that's OK */
+  sk->cong_count = 0;
 
-  /* Do the actuall retransmit. */
+  sk->cong_window = 1;
+
+  /* Do the actual retransmit. */
   ip_retransmit(sk, all);
 }
 
@@ -213,7 +260,7 @@ tcp_err(int err, unsigned char *header, unsigned long daddr,
   if(err<0)
   {
   	sk->err = -err;
-  	wake_up(sk->sleep);
+  	sk->error_report(sk);
   	return;
   }
 
@@ -237,7 +284,7 @@ tcp_err(int err, unsigned char *header, unsigned long daddr,
   if (icmp_err_convert[err & 0xff].fatal) {
 	if (sk->state == TCP_SYN_SENT) {
 		sk->state = TCP_CLOSE;
-		wake_up(sk->sleep);	/* Wake people up to see the error (see connect in sock.c) */
+		sk->error_report(sk);		/* Wake people up to see the error (see connect in sock.c) */
 	}
   }
   return;
@@ -301,7 +348,7 @@ tcp_readable(struct sock *sk)
 		if (skb->h.th->syn) amount--;
 		counted += sum;
 	}
-/*	if (amount && skb->h.th->psh) break;*/
+	if (amount && skb->h.th->psh) break;
 	skb =(struct sk_buff *)skb->next;		/* Move along */
   } while(skb != sk->rqueue);
   restore_flags(flags);
@@ -373,7 +420,7 @@ tcp_select(struct sock *sk, int sel_type, select_table *wait)
 		 * Hack so it will probably be able to write
 		 * something if it says it's ok to write.
 		 */
-		if (sk->prot->wspace(sk) >= sk->mtu) {
+		if (sk->prot->wspace(sk) >= sk->mss) {
 			release_sock(sk);
 			/* This should cause connect to work ok. */
 			if (sk->state == TCP_SYN_RECV ||
@@ -540,49 +587,111 @@ tcp_check(struct tcphdr *th, int len,
 }
 
 
-void
-tcp_send_check(struct tcphdr *th, unsigned long saddr, 
-	       unsigned long daddr, int len, struct sock *sk)
+void tcp_send_check(struct tcphdr *th, unsigned long saddr, 
+		unsigned long daddr, int len, struct sock *sk)
 {
-  th->check = 0;
-  th->check = tcp_check(th, len, saddr, daddr);
-  return;
+	th->check = 0;
+	th->check = tcp_check(th, len, saddr, daddr);
+	return;
 }
 
-
-static void
-tcp_send_partial(struct sock *sk)
+static void tcp_send_skb(struct sock *sk, struct sk_buff *skb)
 {
-  struct sk_buff *skb;
-  
-  if (sk == NULL || sk->send_tmp == NULL) return;
-  
-  skb = sk->send_tmp;
+	int size;
 
-  /* We need to complete and send the packet. */
-  tcp_send_check(skb->h.th, sk->saddr, sk->daddr,
-		 skb->len-(unsigned long)skb->h.th +
-		(unsigned long)(skb+1), sk);
-  
-  skb->h.seq = sk->send_seq;
-  if (after(sk->send_seq , sk->window_seq) ||
-      sk->packets_out >= sk->cong_window) {
-	DPRINTF((DBG_TCP, "sk->cong_window = %d, sk->packets_out = %d\n",
-					sk->cong_window, sk->packets_out));
-	DPRINTF((DBG_TCP, "sk->send_seq = %d, sk->window_seq = %d\n",
-					sk->send_seq, sk->window_seq));
-	skb->next = NULL;
-	skb->magic = TCP_WRITE_QUEUE_MAGIC;
-	if (sk->wback == NULL) {
-		sk->wfront=skb;
-	} else {
-		sk->wback->next = skb;
+	/* length of packet (not counting length of pre-tcp headers) */
+	size = skb->len - ((unsigned char *) skb->h.th - skb->data);
+
+	/* sanity check it.. */
+	if (size < sizeof(struct tcphdr) || size > skb->len) {
+		printk("tcp_send_skb: bad skb (skb = %p, data = %p, th = %p, len = %lu)\n",
+			skb, skb->data, skb->h.th, skb->len);
+		kfree_skb(skb, FREE_WRITE);
+		return;
 	}
-	sk->wback = skb;
-  } else {
-	sk->prot->queue_xmit(sk, skb->dev, skb,0);
-  }
-  sk->send_tmp = NULL;
+
+	/* If we have queued a header size packet.. */
+	if (size == sizeof(struct tcphdr)) {
+		/* If its got a syn or fin its notionally included in the size..*/
+		if(!skb->h.th->syn && !skb->h.th->fin) {
+			printk("tcp_send_skb: attempt to queue a bogon.\n");
+			kfree_skb(skb,FREE_WRITE);
+			return;
+		}
+	}
+  
+	/* We need to complete and send the packet. */
+	tcp_send_check(skb->h.th, sk->saddr, sk->daddr, size, sk);
+
+	skb->h.seq = sk->send_seq;
+	if (after(sk->send_seq , sk->window_seq) ||
+	    (sk->retransmits && sk->timeout == TIME_WRITE) ||
+	     sk->packets_out >= sk->cong_window) {
+		DPRINTF((DBG_TCP, "sk->cong_window = %d, sk->packets_out = %d\n",
+					sk->cong_window, sk->packets_out));
+		DPRINTF((DBG_TCP, "sk->send_seq = %d, sk->window_seq = %d\n",
+					sk->send_seq, sk->window_seq));
+		skb->next = NULL;
+		skb->magic = TCP_WRITE_QUEUE_MAGIC;
+		if (sk->wback == NULL) {
+			sk->wfront = skb;
+		} else {
+			sk->wback->next = skb;
+		}
+		sk->wback = skb;
+		if (before(sk->window_seq, sk->wfront->h.seq) &&
+		    sk->send_head == NULL &&
+		    sk->ack_backlog == 0)
+		  reset_timer(sk, TIME_PROBE0, sk->rto);
+	} else {
+		sk->prot->queue_xmit(sk, skb->dev, skb, 0);
+	}
+}
+
+struct sk_buff * tcp_dequeue_partial(struct sock * sk)
+{
+	struct sk_buff * skb;
+	unsigned long flags;
+
+	save_flags(flags);
+	cli();
+	skb = sk->partial;
+	if (skb) {
+		sk->partial = NULL;
+		del_timer(&sk->partial_timer);
+	}
+	restore_flags(flags);
+	return skb;
+}
+
+static void tcp_send_partial(struct sock *sk)
+{
+	struct sk_buff *skb;
+
+	if (sk == NULL)
+		return;
+	while ((skb = tcp_dequeue_partial(sk)) != NULL)
+		tcp_send_skb(sk, skb);
+}
+
+void tcp_enqueue_partial(struct sk_buff * skb, struct sock * sk)
+{
+	struct sk_buff * tmp;
+	unsigned long flags;
+
+	save_flags(flags);
+	cli();
+	tmp = sk->partial;
+	if (tmp)
+		del_timer(&sk->partial_timer);
+	sk->partial = skb;
+	sk->partial_timer.expires = HZ;
+	sk->partial_timer.function = (void (*)(unsigned long)) tcp_send_partial;
+	sk->partial_timer.data = (unsigned long) sk;
+	add_timer(&sk->partial_timer);
+	restore_flags(flags);
+	if (tmp)
+		tcp_send_skb(sk, tmp);
 }
 
 
@@ -603,7 +712,7 @@ tcp_send_ack(unsigned long sequence, unsigned long ack,
    * We need to grab some memory, and put together an ack,
    * and then put it into the queue to be sent.
    */
-  buff = (struct sk_buff *) sk->prot->wmalloc(sk, MAX_ACK_SIZE, 1, GFP_ATOMIC);
+  buff = sk->prot->wmalloc(sk, MAX_ACK_SIZE, 1, GFP_ATOMIC);
   if (buff == NULL) {
 	/* Force it to send an ack. */
 	sk->ack_backlog++;
@@ -618,11 +727,11 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_ack: malloc failed\n");
   buff->mem_len = MAX_ACK_SIZE;
   buff->len = sizeof(struct tcphdr);
   buff->sk = sk;
-  t1 =(struct tcphdr *)(buff + 1);
+  t1 =(struct tcphdr *) buff->data;
 
   /* Put in the IP header and routing stuff. */
   tmp = sk->prot->build_header(buff, sk->saddr, daddr, &dev,
-				IPPROTO_TCP, sk->opt, MAX_ACK_SIZE);
+				IPPROTO_TCP, sk->opt, MAX_ACK_SIZE,sk->ip_tos,sk->ip_ttl);
   if (tmp < 0) {
   	buff->free=1;
 	sk->prot->wfree(sk, buff->mem_addr, buff->mem_len);
@@ -640,7 +749,7 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_ack: build_header failed\n");
   t1->source = th->dest;
   t1->seq = ntohl(sequence);
   t1->ack = 1;
-  sk->window = sk->prot->rspace(sk);
+  sk->window = tcp_select_window(sk);/*sk->prot->rspace(sk);*/
   t1->window = ntohs(sk->window);
   t1->res1 = 0;
   t1->res2 = 0;
@@ -653,8 +762,12 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_ack: build_header failed\n");
 	sk->ack_backlog = 0;
 	sk->bytes_rcv = 0;
 	sk->ack_timed = 0;
-	if (sk->send_head == NULL && sk->wfront == NULL) {
-/*		delete_timer(sk);*/
+	if (sk->send_head == NULL && sk->wfront == NULL && sk->timeout == TIME_WRITE) 
+	{
+		if(sk->keepopen)
+			reset_timer(sk,TIME_KEEPOPEN,TCP_TIMEOUT_LEN);
+		else
+			delete_timer(sk);
 	}
   }
   t1->ack_seq = ntohl(ack);
@@ -682,12 +795,11 @@ tcp_build_header(struct tcphdr *th, struct sock *sk, int push)
   sk->bytes_rcv = 0;
   sk->ack_timed = 0;
   th->ack_seq = htonl(sk->acked_seq);
-  sk->window = sk->prot->rspace(sk);
+  sk->window = tcp_select_window(sk)/*sk->prot->rspace(sk)*/;
   th->window = htons(sk->window);
 
   return(sizeof(*th));
 }
-
 
 /*
  * This routine copies from a user buffer into a socket,
@@ -701,6 +813,7 @@ tcp_write(struct sock *sk, unsigned char *from,
   int copy;
   int tmp;
   struct sk_buff *skb;
+  struct sk_buff *send_tmp;
   unsigned char *buff;
   struct proto *prot;
   struct device *dev = NULL;
@@ -780,69 +893,87 @@ tcp_write(struct sock *sk, unsigned char *from,
 		sti();
 	}
 
+/*
+ * The following code can result in copy <= if sk->mss is ever
+ * decreased.  It shouldn't be.  sk->mss is min(sk->mtu, sk->max_window).
+ * sk->mtu is constant once SYN processing is finished.  I.e. we
+ * had better not get here until we've seen his SYN and at least one
+ * valid ack.  (The SYN sets sk->mtu and the ack sets sk->max_window.)
+ * But ESTABLISHED should guarantee that.  sk->max_window is by definition
+ * non-decreasing.  Note that any ioctl to set user_mss must be done
+ * before the exchange of SYN's.  If the initial ack from the other
+ * end has a window of 0, max_window and thus mss will both be 0.
+ */
+
 	/* Now we need to check if we have a half built packet. */
-	if (sk->send_tmp != NULL) {
-		/* If sk->mss has been changed this could cause problems. */
+	if ((skb = tcp_dequeue_partial(sk)) != NULL) {
+	        int hdrlen;
+
+	         /* IP header + TCP header */
+		hdrlen = ((unsigned long)skb->h.th - (unsigned long)skb->data)
+		         + sizeof(struct tcphdr);
 
 		/* Add more stuff to the end of skb->len */
-		skb = sk->send_tmp;
 		if (!(flags & MSG_OOB)) {
-			copy = min(sk->mss - skb->len + 128 +
-				   prot->max_header, len);
-	      
-		/* FIXME: this is really a bug. */
-		if (copy <= 0) {
-			printk("TCP: **bug**: \"copy\" <= 0!!\n");
-			copy = 0;
-		}
+			copy = min(sk->mss - (skb->len - hdrlen), len);
+			/* FIXME: this is really a bug. */
+			if (copy <= 0) {
+			  printk("TCP: **bug**: \"copy\" <= 0!!\n");
+			  copy = 0;
+			}
 	  
-		memcpy_fromfs((unsigned char *)(skb+1) + skb->len, from, copy);
-		skb->len += copy;
-		from += copy;
-		copied += copy;
-		len -= copy;
-		sk->send_seq += copy;
+			memcpy_fromfs(skb->data + skb->len, from, copy);
+			skb->len += copy;
+			from += copy;
+			copied += copy;
+			len -= copy;
+			sk->send_seq += copy;
+		      }
+		if ((skb->len - hdrlen) >= sk->mss ||
+		    (flags & MSG_OOB) ||
+		    !sk->packets_out)
+			tcp_send_skb(sk, skb);
+		else
+			tcp_enqueue_partial(skb, sk);
+		continue;
 	}
 
-	if (skb->len -(unsigned long)skb->h.th +
-	   (unsigned long)(skb+1) >= sk->mss ||(flags & MSG_OOB)) {
-		tcp_send_partial(sk);
-	}
-	continue;
-  }
+	/*
+	 * We also need to worry about the window.
+ 	 * If window < 1/2 the maximum window we've seen from this
+ 	 *   host, don't use it.  This is sender side
+ 	 *   silly window prevention, as specified in RFC1122.
+ 	 *   (Note that this is diffferent than earlier versions of
+ 	 *   SWS prevention, e.g. RFC813.).  What we actually do is 
+	 *   use the whole MSS.  Since the results in the right
+	 *   edge of the packet being outside the window, it will
+	 *   be queued for later rather than sent.
+	 */
 
-  /*
-   * We also need to worry about the window.
-   * The smallest we will send is about 200 bytes.
-   * This is a bit sad for TCP/AMPR people running
-   * 196 byte windows! - FIXME
-   */
-  copy = min(sk->mtu, diff(sk->window_seq, sk->send_seq));
-
-  /* FIXME: redundent check here. */
-  if (copy < 200 || copy > sk->mtu) copy = sk->mtu;
-  copy = min(copy, len);
+	copy = diff(sk->window_seq, sk->send_seq);
+	/* what if max_window == 1?  In that case max_window >> 1 is 0.
+	 * however in that case copy == max_window, so it's OK to use 
+	 * the window */
+	if (copy < (sk->max_window >> 1))
+	  copy = sk->mss;
+	copy = min(copy, sk->mss);
+	copy = min(copy, len);
 
   /* We should really check the window here also. */
-  if (sk->packets_out && copy < sk->mss && !(flags & MSG_OOB)) {
+	send_tmp = NULL;
+	if (copy < sk->mss && !(flags & MSG_OOB)) {
 	/* We will release the socket incase we sleep here. */
-	release_sock(sk);
-	skb = (struct sk_buff *) prot->wmalloc(sk,
-			sk->mss + 128 + prot->max_header +
-			sizeof(*skb), 0, GFP_KERNEL);
-	sk->inuse = 1;
-	sk->send_tmp = skb;
-	if (skb != NULL)
-		skb->mem_len = sk->mss + 128 + prot->max_header + sizeof(*skb);
+	  release_sock(sk);
+	  /* NB: following must be mtu, because mss can be increased.
+	   * mss is always <= mtu */
+	  skb = prot->wmalloc(sk, sk->mtu + 128 + prot->max_header + sizeof(*skb), 0, GFP_KERNEL);
+	  sk->inuse = 1;
+	  send_tmp = skb;
 	} else {
 		/* We will release the socket incase we sleep here. */
-		release_sock(sk);
-		skb = (struct sk_buff *) prot->wmalloc(sk,
-				copy + prot->max_header +
-				sizeof(*skb), 0, GFP_KERNEL);
-		sk->inuse = 1;
-		if (skb != NULL)
-			skb->mem_len = copy+prot->max_header + sizeof(*skb);
+	  release_sock(sk);
+	  skb = prot->wmalloc(sk, copy + prot->max_header + sizeof(*skb), 0, GFP_KERNEL);
+	  sk->inuse = 1;
 	}
 
 	/* If we didn't get any memory, we need to sleep. */
@@ -875,19 +1006,18 @@ tcp_write(struct sock *sk, unsigned char *from,
 		continue;
 	}
 
-	skb->mem_addr = skb;
 	skb->len = 0;
 	skb->sk = sk;
 	skb->free = 0;
 
-	buff =(unsigned char *)(skb+1);
+	buff = skb->data;
 
 	/*
 	 * FIXME: we need to optimize this.
 	 * Perhaps some hints here would be good.
 	 */
 	tmp = prot->build_header(skb, sk->saddr, sk->daddr, &dev,
-				 IPPROTO_TCP, sk->opt, skb->mem_len);
+				 IPPROTO_TCP, sk->opt, skb->mem_len,sk->ip_tos,sk->ip_ttl);
 	if (tmp < 0 ) {
 		prot->wfree(sk, skb->mem_addr, skb->mem_len);
 		release_sock(sk);
@@ -922,33 +1052,27 @@ tcp_write(struct sock *sk, unsigned char *from,
 	skb->free = 0;
 	sk->send_seq += copy;
 
-	if (sk->send_tmp != NULL) continue;
-
-	tcp_send_check((struct tcphdr *)buff, sk->saddr, sk->daddr,
-		        copy + sizeof(struct tcphdr), sk);
-
-	skb->h.seq = sk->send_seq;
-	if (after(sk->send_seq , sk->window_seq) ||
-		  sk->packets_out >= sk->cong_window) {
-		DPRINTF((DBG_TCP, "sk->cong_window = %d, sk->packets_out = %d\n",
-					sk->cong_window, sk->packets_out));
-		DPRINTF((DBG_TCP, "sk->send_seq = %d, sk->window_seq = %d\n",
-					sk->send_seq, sk->window_seq));
-		skb->next = NULL;
-		skb->magic = TCP_WRITE_QUEUE_MAGIC;
-		if (sk->wback == NULL) {
-			sk->wfront = skb;
-		} else {
-			sk->wback->next = skb;
-		}
-		sk->wback = skb;
-	} else {
-		prot->queue_xmit(sk, dev, skb,0);
+	if (send_tmp != NULL && sk->packets_out) {
+		tcp_enqueue_partial(send_tmp, sk);
+		continue;
 	}
+	tcp_send_skb(sk, skb);
   }
   sk->err = 0;
+
+/*
+ *	Nagles rule. Turn Nagle off with TCP_NODELAY for highly
+ *	interactive fast network servers. It's meant to be on and
+ *	it really improves the throughput though not the echo time
+ *	on my slow slip link - Alan
+ */
+
   /* Avoid possible race on send_tmp - c/o Johannes Stille */
-  if(sk->send_tmp && !sk->packets_out)
+  if(sk->partial && 
+     ((!sk->packets_out) 
+     /* If not nagling we can send on the before case too.. */
+      || (sk->nonagle && before(sk->send_seq , sk->window_seq))
+      ))
   	tcp_send_partial(sk);
   /* -- */
   release_sock(sk);
@@ -994,7 +1118,7 @@ tcp_read_wakeup(struct sock *sk)
    * We need to grab some memory, and put together an ack,
    * and then put it into the queue to be sent.
    */
-  buff = (struct sk_buff *) sk->prot->wmalloc(sk,MAX_ACK_SIZE,1, GFP_ATOMIC);
+  buff = sk->prot->wmalloc(sk,MAX_ACK_SIZE,1, GFP_ATOMIC);
   if (buff == NULL) {
 	/* Try again real soon. */
 	reset_timer(sk, TIME_WRITE, 10);
@@ -1008,7 +1132,7 @@ tcp_read_wakeup(struct sock *sk)
 
   /* Put in the IP header and routing stuff. */
   tmp = sk->prot->build_header(buff, sk->saddr, sk->daddr, &dev,
-			       IPPROTO_TCP, sk->opt, MAX_ACK_SIZE);
+			       IPPROTO_TCP, sk->opt, MAX_ACK_SIZE,sk->ip_tos,sk->ip_ttl);
   if (tmp < 0) {
   	buff->free=1;
 	sk->prot->wfree(sk, buff->mem_addr, buff->mem_len);
@@ -1016,7 +1140,7 @@ tcp_read_wakeup(struct sock *sk)
   }
 
   buff->len += tmp;
-  t1 =(struct tcphdr *)((char *)(buff+1) +tmp);
+  t1 =(struct tcphdr *)(buff->data +tmp);
 
   memcpy(t1,(void *) &sk->dummy_th, sizeof(*t1));
   t1->seq = ntohl(sk->send_seq);
@@ -1029,7 +1153,7 @@ tcp_read_wakeup(struct sock *sk)
   t1->psh = 0;
   sk->ack_backlog = 0;
   sk->bytes_rcv = 0;
-  sk->window = sk->prot->rspace(sk);
+  sk->window = tcp_select_window(sk);/*sk->prot->rspace(sk);*/
   t1->window = ntohs(sk->window);
   t1->ack_seq = ntohl(sk->acked_seq);
   t1->doff = sizeof(*t1)/4;
@@ -1099,6 +1223,14 @@ cleanup_rbuf(struct sock *sk)
 	 * the user reads some more.
 	 */
 	sk->ack_backlog++;
+/*
+ * It's unclear whether to use sk->mtu or sk->mss here.  They differ only
+ * if the other end is offering a window smaller than the agreed on MSS
+ * (called sk->mtu here).  In theory there's no connection between send
+ * and receive, and so no reason to think that they're going to send
+ * small packets.  For the moment I'm using the hack of reducing the mss
+ * only on the send side, so I'm putting mtu here.
+ */
 	if ((sk->prot->rspace(sk) > (sk->window - sk->bytes_rcv + sk->mtu))) {
 		/* Send an ack right now. */
 		tcp_read_wakeup(sk);
@@ -1189,7 +1321,6 @@ tcp_read_urg(struct sock * sk, int nonblock,
 			amt = min(ntohs(skb->h.th->urg_ptr),len);
 			if(amt)
 			{
-				verify_area(VERIFY_WRITE, to, amt);
 				memcpy_tofs(to,(unsigned char *)(skb->h.th) +
 							skb->h.th->doff*4, amt);
 			}
@@ -1205,7 +1336,7 @@ tcp_read_urg(struct sock * sk, int nonblock,
 		skb =(struct sk_buff *)skb->next;
 	} while(skb != sk->rqueue);
   }
-  sk->urg = 0;
+/*sk->urg = 0;*/
   release_sock(sk);
   return(0);
 }
@@ -1465,12 +1596,13 @@ tcp_shutdown(struct sock *sk, int how)
   sk->inuse = 1;
 
   /* Clear out any half completed packets. */
-  if (sk->send_tmp) tcp_send_partial(sk);
+  if (sk->partial)
+	tcp_send_partial(sk);
 
   prot =(struct proto *)sk->prot;
   th =(struct tcphdr *)&sk->dummy_th;
   release_sock(sk); /* incase the malloc sleeps. */
-  buff = (struct sk_buff *) prot->wmalloc(sk, MAX_RESET_SIZE,1 , GFP_KERNEL);
+  buff = prot->wmalloc(sk, MAX_RESET_SIZE,1 , GFP_KERNEL);
   if (buff == NULL) return;
   sk->inuse = 1;
 
@@ -1479,12 +1611,12 @@ tcp_shutdown(struct sock *sk, int how)
   buff->mem_len = MAX_RESET_SIZE;
   buff->sk = sk;
   buff->len = sizeof(*t1);
-  t1 =(struct tcphdr *)(buff + 1);
+  t1 =(struct tcphdr *) buff->data;
 
   /* Put in the IP header and routing stuff. */
   tmp = prot->build_header(buff,sk->saddr, sk->daddr, &dev,
 			   IPPROTO_TCP, sk->opt,
-			   sizeof(struct tcphdr));
+			   sizeof(struct tcphdr),sk->ip_tos,sk->ip_ttl);
   if (tmp < 0) {
   	buff->free=1;
 	prot->wfree(sk,buff->mem_addr, buff->mem_len);
@@ -1494,7 +1626,7 @@ tcp_shutdown(struct sock *sk, int how)
   }
 
   t1 =(struct tcphdr *)((char *)t1 +tmp);
-  buff ->len += tmp;
+  buff->len += tmp;
   buff->dev = dev;
   memcpy(t1, th, sizeof(*t1));
   t1->seq = ntohl(sk->send_seq);
@@ -1502,7 +1634,7 @@ tcp_shutdown(struct sock *sk, int how)
   buff->h.seq = sk->send_seq;
   t1->ack = 1;
   t1->ack_seq = ntohl(sk->acked_seq);
-  t1->window = ntohs(sk->prot->rspace(sk));
+  t1->window = ntohs(sk->window=tcp_select_window(sk)/*sk->prot->rspace(sk)*/);
   t1->fin = 1;
   t1->rst = 0;
   t1->doff = sizeof(*t1)/4;
@@ -1569,7 +1701,7 @@ tcp_recvfrom(struct sock *sk, unsigned char *to,
 /* This routine will send an RST to the other tcp. */
 static void
 tcp_reset(unsigned long saddr, unsigned long daddr, struct tcphdr *th,
-	  struct proto *prot, struct options *opt, struct device *dev)
+	  struct proto *prot, struct options *opt, struct device *dev, int tos, int ttl)
 {
   struct sk_buff *buff;
   struct tcphdr *t1;
@@ -1579,7 +1711,7 @@ tcp_reset(unsigned long saddr, unsigned long daddr, struct tcphdr *th,
    * We need to grab some memory, and put together an RST,
    * and then put it into the queue to be sent.
    */
-  buff = (struct sk_buff *) prot->wmalloc(NULL, MAX_RESET_SIZE, 1, GFP_ATOMIC);
+  buff = prot->wmalloc(NULL, MAX_RESET_SIZE, 1, GFP_ATOMIC);
   if (buff == NULL) 
   	return;
 
@@ -1590,11 +1722,11 @@ tcp_reset(unsigned long saddr, unsigned long daddr, struct tcphdr *th,
   buff->sk = NULL;
   buff->dev = dev;
 
-  t1 =(struct tcphdr *)(buff + 1);
+  t1 =(struct tcphdr *) buff->data;
 
   /* Put in the IP header and routing stuff. */
   tmp = prot->build_header(buff, saddr, daddr, &dev, IPPROTO_TCP, opt,
-			   sizeof(struct tcphdr));
+			   sizeof(struct tcphdr),tos,ttl);
   if (tmp < 0) {
   	buff->free = 1;
 	prot->wfree(NULL, buff->mem_addr, buff->mem_len);
@@ -1637,7 +1769,11 @@ tcp_reset(unsigned long saddr, unsigned long daddr, struct tcphdr *th,
 
 
 /*
- *	Look for tcp options. Parses everything but only knows about MSS
+ *	Look for tcp options. Parses everything but only knows about MSS.
+ *      This routine is always called with the packet containing the SYN.
+ *      However it may also be called with the ack to the SYN.  So you
+ *      can't assume this is always the SYN.  It's always called after
+ *      we have set up sk->mtu to our own MTU.
  */
  
 static void
@@ -1645,7 +1781,7 @@ tcp_options(struct sock *sk, struct tcphdr *th)
 {
   unsigned char *ptr;
   int length=(th->doff*4)-sizeof(struct tcphdr);
-  int mtuset=0;
+  int mss_seen = 0;
     
   ptr = (unsigned char *)(th + 1);
   
@@ -1667,10 +1803,10 @@ tcp_options(struct sock *sk, struct tcphdr *th)
   			switch(opcode)
   			{
   				case TCPOPT_MSS:
-  					if(opsize==4)
+  					if(opsize==4 && th->syn)
   					{
   						sk->mtu=min(sk->mtu,ntohs(*(unsigned short *)ptr));
-  						mtuset=1;
+						mss_seen = 1;
   					}
   					break;
   				/* Add other options here as people feel the urge to implement stuff like large windows */
@@ -1679,12 +1815,21 @@ tcp_options(struct sock *sk, struct tcphdr *th)
   			length-=opsize;
   	}
   }
-  					
-  if (!mtuset) 
-  {
-	sk->mtu = min(sk->mtu, 576 - HEADER_SIZE);
-	return;
+  if (th->syn) {
+    if (! mss_seen)
+      sk->mtu=min(sk->mtu, 536);  /* default MSS if none sent */
   }
+  sk->mss = min(sk->max_window, sk->mtu);
+}
+
+static inline unsigned long default_mask(unsigned long dst)
+{
+	dst = ntohl(dst);
+	if (IN_CLASSA(dst))
+		return htonl(IN_CLASSA_NET);
+	if (IN_CLASSB(dst))
+		return htonl(IN_CLASSB_NET);
+	return htonl(IN_CLASSC_NET);
 }
 
 /*
@@ -1714,10 +1859,10 @@ tcp_conn_request(struct sock *sk, struct sk_buff *skb,
 
   /* If the socket is dead, don't accept the connection. */
   if (!sk->dead) {
-	wake_up(sk->sleep);
+  	sk->data_ready(sk,0);
   } else {
 	DPRINTF((DBG_TCP, "tcp_conn_request on dead socket\n"));
-	tcp_reset(daddr, saddr, th, sk->prot, opt, dev);
+	tcp_reset(daddr, saddr, th, sk->prot, opt, dev, sk->ip_tos,sk->ip_ttl);
 	kfree_skb(skb, FREE_READ);
 	return;
   }
@@ -1753,14 +1898,19 @@ tcp_conn_request(struct sock *sk, struct sk_buff *skb,
   newsk->send_head = NULL;
   newsk->send_tail = NULL;
   newsk->back_log = NULL;
-  newsk->rtt = TCP_CONNECT_TIME;
+  newsk->rtt = TCP_CONNECT_TIME << 3;
+  newsk->rto = TCP_CONNECT_TIME;
   newsk->mdev = 0;
+  newsk->max_window = 0;
+  newsk->cong_window = 1;
+  newsk->cong_count = 0;
+  newsk->ssthresh = 0;
   newsk->backoff = 0;
   newsk->blog = 0;
   newsk->intr = 0;
   newsk->proc = 0;
   newsk->done = 0;
-  newsk->send_tmp = NULL;
+  newsk->partial = NULL;
   newsk->pair = NULL;
   newsk->wmem_alloc = 0;
   newsk->rmem_alloc = 0;
@@ -1776,6 +1926,7 @@ tcp_conn_request(struct sock *sk, struct sk_buff *skb,
   newsk->state = TCP_SYN_RECV;
   newsk->timeout = 0;
   newsk->send_seq = jiffies * SEQ_TICK - seq_offset;
+  newsk->window_seq = newsk->send_seq;
   newsk->rcv_ack_seq = newsk->send_seq;
   newsk->urg =0;
   newsk->retransmits = 0;
@@ -1802,22 +1953,31 @@ tcp_conn_request(struct sock *sk, struct sk_buff *skb,
   newsk->acked_seq = skb->h.th->seq + 1;
   newsk->copied_seq = skb->h.th->seq;
 
-#ifdef OLDWAY
-  if (skb->h.th->doff == 5) {
-	newsk->mtu = dev->mtu - HEADER_SIZE;
-  } else {
-	ptr =(unsigned char *)(skb->h.th + 1);
-	if (ptr[0] != 2 || ptr[1] != 4) {
-		newsk->mtu = dev->mtu - HEADER_SIZE;
-	} else {
-		newsk->mtu = min(ptr[2] * 256 + ptr[3] - HEADER_SIZE,
-			         dev->mtu - HEADER_SIZE);
-	}
-  }
+  /* Grab the ttl and tos values and use them */
+  newsk->ip_ttl=sk->ip_ttl;
+  newsk->ip_tos=skb->ip_hdr->tos;
+
+/* use 512 or whatever user asked for */
+/* note use of sk->user_mss, since user has no direct access to newsk */
+  if (sk->user_mss)
+    newsk->mtu = sk->user_mss;
+  else {
+#ifdef SUBNETSARELOCAL
+    if ((saddr ^ daddr) & default_mask(saddr))
 #else
-  tcp_options(newsk,skb->h.th);
+    if ((saddr ^ daddr) & dev->pa_mask)
 #endif
-  buff = (struct sk_buff *) newsk->prot->wmalloc(newsk, MAX_SYN_SIZE, 1, GFP_ATOMIC);
+      newsk->mtu = 576 - HEADER_SIZE;
+    else
+      newsk->mtu = MAX_WINDOW;
+  }
+/* but not bigger than device MTU */
+  newsk->mtu = min(newsk->mtu, dev->mtu - HEADER_SIZE);
+
+/* this will min with what arrived in the packet */
+  tcp_options(newsk,skb->h.th);
+
+  buff = newsk->prot->wmalloc(newsk, MAX_SYN_SIZE, 1, GFP_ATOMIC);
   if (buff == NULL) {
 	sk->err = -ENOMEM;
 	newsk->dead = 1;
@@ -1831,11 +1991,11 @@ tcp_conn_request(struct sock *sk, struct sk_buff *skb,
   buff->len = sizeof(struct tcphdr)+4;
   buff->sk = newsk;
   
-  t1 =(struct tcphdr *)(buff + 1);
+  t1 =(struct tcphdr *) buff->data;
 
   /* Put in the IP header and routing stuff. */
   tmp = sk->prot->build_header(buff, newsk->saddr, newsk->daddr, &dev,
-			       IPPROTO_TCP, NULL, MAX_SYN_SIZE);
+			       IPPROTO_TCP, NULL, MAX_SYN_SIZE,sk->ip_tos,sk->ip_ttl);
 
   /* Something went wrong. */
   if (tmp < 0) {
@@ -1860,7 +2020,7 @@ tcp_conn_request(struct sock *sk, struct sk_buff *skb,
   t1->source = newsk->dummy_th.source;
   t1->seq = ntohl(newsk->send_seq++);
   t1->ack = 1;
-  newsk->window = newsk->prot->rspace(newsk);
+  newsk->window = tcp_select_window(newsk);/*newsk->prot->rspace(newsk);*/
   t1->window = ntohs(newsk->window);
   t1->res1 = 0;
   t1->res2 = 0;
@@ -1874,8 +2034,8 @@ tcp_conn_request(struct sock *sk, struct sk_buff *skb,
   ptr =(unsigned char *)(t1+1);
   ptr[0] = 2;
   ptr[1] = 4;
-  ptr[2] =((dev->mtu - HEADER_SIZE) >> 8) & 0xff;
-  ptr[3] =(dev->mtu - HEADER_SIZE) & 0xff;
+  ptr[2] = ((newsk->mtu) >> 8) & 0xff;
+  ptr[3] =(newsk->mtu) & 0xff;
 
   tcp_send_check(t1, daddr, saddr, sizeof(*t1)+4, newsk);
   newsk->prot->queue_xmit(newsk, dev, buff, 0);
@@ -1912,25 +2072,13 @@ tcp_close(struct sock *sk, int timeout)
   sk->keepopen = 1;
   sk->shutdown = SHUTDOWN_MASK;
 
-  if (!sk->dead) wake_up(sk->sleep);
+  if (!sk->dead) 
+  	sk->state_change(sk);
 
   /* We need to flush the recv. buffs. */
   if (skb_peek(&sk->rqueue) != NULL) 
   {
 	struct sk_buff *skb;
-#ifdef OLD	
-	struct sk_buff *skb2;
-	skb = skb_peek(&sk->rqueue);
-	do {
-		skb2 =(struct sk_buff *)skb->next;
-		/* if there is some real unread data, send a reset. */
-		if (skb->len > 0 &&
-		    after(skb->h.th->seq + skb->len + 1, sk->copied_seq))
-								need_reset = 1;
-		kfree_skb(skb, FREE_WRITE);
-		skb = skb2;
-	} while(skb != sk->rqueue);
-#else
 	if(sk->debug)
 		printk("Clean rcv queue\n");
 	while((skb=skb_dequeue(&sk->rqueue))!=NULL)
@@ -1941,12 +2089,11 @@ tcp_close(struct sock *sk, int timeout)
 	}
 	if(sk->debug)
 		printk("Cleaned.\n");
-#endif
   }
   sk->rqueue = NULL;
 
   /* Get rid off any half-completed packets. */
-  if (sk->send_tmp) {
+  if (sk->partial) {
 	tcp_send_partial(sk);
   }
 
@@ -1955,7 +2102,11 @@ tcp_close(struct sock *sk, int timeout)
 	case TCP_FIN_WAIT2:
 	case TCP_LAST_ACK:
 		/* start a timer. */
-		reset_timer(sk, TIME_CLOSE, 4 * sk->rtt);
+                /* original code was 4 * sk->rtt.  In converting to the
+		 * new rtt representation, we can't quite use that.
+		 * it seems to make most sense to  use the backed off value
+		 */
+		reset_timer(sk, TIME_CLOSE, 4 * sk->rto);
 		if (timeout) tcp_time_wait(sk);
 		release_sock(sk);
 		return;	/* break causes a double release - messy */
@@ -1978,7 +2129,7 @@ tcp_close(struct sock *sk, int timeout)
 	case TCP_SYN_RECV:
 		prot =(struct proto *)sk->prot;
 		th =(struct tcphdr *)&sk->dummy_th;
-		buff = (struct sk_buff *) prot->wmalloc(sk, MAX_FIN_SIZE, 1, GFP_ATOMIC);
+		buff = prot->wmalloc(sk, MAX_FIN_SIZE, 1, GFP_ATOMIC);
 		if (buff == NULL) {
 			/* This will force it to try again later. */
 			/* Or it would have if someone released the socket
@@ -1994,12 +2145,12 @@ tcp_close(struct sock *sk, int timeout)
 		buff->sk = sk;
 		buff->free = 1;
 		buff->len = sizeof(*t1);
-		t1 =(struct tcphdr *)(buff + 1);
+		t1 =(struct tcphdr *) buff->data;
 
 		/* Put in the IP header and routing stuff. */
 		tmp = prot->build_header(buff,sk->saddr, sk->daddr, &dev,
 					 IPPROTO_TCP, sk->opt,
-				         sizeof(struct tcphdr));
+				         sizeof(struct tcphdr),sk->ip_tos,sk->ip_ttl);
 		if (tmp < 0) {
 			kfree_skb(buff,FREE_WRITE);
 			DPRINTF((DBG_TCP, "Unable to build header for fin.\n"));
@@ -2008,7 +2159,7 @@ tcp_close(struct sock *sk, int timeout)
 		}
 
 		t1 =(struct tcphdr *)((char *)t1 +tmp);
-		buff ->len += tmp;
+		buff->len += tmp;
 		buff->dev = dev;
 		memcpy(t1, th, sizeof(*t1));
 		t1->seq = ntohl(sk->send_seq);
@@ -2019,7 +2170,7 @@ tcp_close(struct sock *sk, int timeout)
 		/* Ack everything immediately from now on. */
 		sk->delay_acks = 0;
 		t1->ack_seq = ntohl(sk->acked_seq);
-		t1->window = ntohs(sk->prot->rspace(sk));
+		t1->window = ntohs(sk->window=tcp_select_window(sk)/*sk->prot->rspace(sk)*/);
 		t1->fin = 1;
 		t1->rst = need_reset;
 		t1->doff = sizeof(*t1)/4;
@@ -2028,11 +2179,10 @@ tcp_close(struct sock *sk, int timeout)
 		if (sk->wfront == NULL) {
 			prot->queue_xmit(sk, dev, buff, 0);
 		} else {
-			reset_timer(sk, TIME_WRITE,
-			  backoff(sk->backoff) * (2 * sk->mdev + sk->rtt));
+			reset_timer(sk, TIME_WRITE, sk->rto);
 			buff->next = NULL;
 			if (sk->wback == NULL) {
-				sk->wfront=buff;
+				sk->wfront = buff;
 			} else {
 				sk->wback->next = buff;
 			}
@@ -2067,11 +2217,14 @@ tcp_write_xmit(struct sock *sk)
 	return;
 
   while(sk->wfront != NULL &&
-        before(sk->wfront->h.seq, sk->window_seq) &&
-        sk->packets_out < sk->cong_window) {
+        before(sk->wfront->h.seq, sk->window_seq +1) &&
+	(sk->retransmits == 0 ||
+	 sk->timeout != TIME_WRITE ||
+	 before(sk->wfront->h.seq, sk->rcv_ack_seq +1))
+        && sk->packets_out < sk->cong_window) {
 		skb = sk->wfront;
 		IS_SKB(skb);
-		sk->wfront =(struct sk_buff *)skb->next;
+		sk->wfront = skb->next;
 		if (sk->wfront == NULL) sk->wback = NULL;
 		skb->next = NULL;
 		if (skb->magic != TCP_WRITE_QUEUE_MAGIC) {
@@ -2088,7 +2241,7 @@ tcp_write_xmit(struct sock *sk)
 		if (before(skb->h.seq, sk->rcv_ack_seq +1)) {
 			sk->retransmits = 0;
 			kfree_skb(skb, FREE_WRITE);
-			if (!sk->dead) wake_up(sk->sleep);
+			if (!sk->dead) sk->write_space(sk);
 		} else {
 			sk->prot->queue_xmit(sk, skb->dev, skb, skb->free);
 		}
@@ -2134,6 +2287,12 @@ tcp_ack(struct sock *sk, struct tcphdr *th, unsigned long saddr, int len)
 {
   unsigned long ack;
   int flag = 0;
+  /* 
+   * 1 - there was data in packet as well as ack or new data is sent or 
+   *     in shutdown state
+   * 2 - data from retransmit queue was acked and removed
+   * 4 - window shrunk or data from retransmit queue was acked and removed
+   */
 
   if(sk->zapped)
 	return(1);	/* Dead, cant ack any more so why bother */
@@ -2142,6 +2301,14 @@ tcp_ack(struct sock *sk, struct tcphdr *th, unsigned long saddr, int len)
   DPRINTF((DBG_TCP, "tcp_ack ack=%d, window=%d, "
 	  "sk->rcv_ack_seq=%d, sk->window_seq = %d\n",
 	  ack, ntohs(th->window), sk->rcv_ack_seq, sk->window_seq));
+
+  if (ntohs(th->window) > sk->max_window) {
+  	sk->max_window = ntohs(th->window);
+	sk->mss = min(sk->max_window, sk->mtu);
+  }
+
+  if (sk->retransmits && sk->timeout == TIME_KEEPOPEN)
+  	sk->retransmits = 0;
 
   if (after(ack, sk->send_seq+1) || before(ack, sk->rcv_ack_seq-1)) {
 	if (after(ack, sk->send_seq) ||
@@ -2185,30 +2352,7 @@ tcp_ack(struct sock *sk, struct tcphdr *th, unsigned long saddr, int len)
 			if (sk->packets_out > 0) sk->packets_out--;
 			/* We may need to remove this from the dev send list. */
 			if (skb->next != NULL) {
-#ifdef OLD_WAY			
-				int i;
-
-				if (skb->next != skb) {
-					skb->next->prev = skb->prev;
-					skb->prev->next = skb->next;
-				}
-
-				for(i = 0; i < DEV_NUMBUFFS; i++) {
-					if (skb->dev->buffs[i] == skb) {
-						if (skb->next == skb)
-							skb->dev->buffs[i] = NULL;
-						  else
-							skb->dev->buffs[i] = skb->next;
-						break;
-					}
-				}
-				if (arp_q == skb) {
-					if (skb->next == skb) arp_q = NULL;
-					  else arp_q = skb->next;
-				}
-#else
 				skb_unlink(skb);				
-#endif				
 			}
 			/* Now add it to the write_queue. */
 			skb->magic = TCP_WRITE_QUEUE_MAGIC;
@@ -2244,13 +2388,53 @@ tcp_ack(struct sock *sk, struct tcphdr *th, unsigned long saddr, int len)
   sk->window_seq = ack + ntohs(th->window);
 
   /* We don't want too many packets out there. */
-  if (sk->cong_window < 2048 && ack != sk->rcv_ack_seq) {
-	if (sk->exp_growth) sk->cong_window *= 2;
-	  else sk->cong_window++;
+  if (sk->timeout == TIME_WRITE && 
+      sk->cong_window < 2048 && after(ack, sk->rcv_ack_seq)) {
+/* 
+ * This is Jacobson's slow start and congestion avoidance. 
+ * SIGCOMM '88, p. 328.  Because we keep cong_window in integral
+ * mss's, we can't do cwnd += 1 / cwnd.  Instead, maintain a 
+ * counter and increment it once every cwnd times.  It's possible
+ * that this should be done only if sk->retransmits == 0.  I'm
+ * interpreting "new data is acked" as including data that has
+ * been retransmitted but is just now being acked.
+ */
+	if (sk->cong_window < sk->ssthresh)  
+	  /* in "safe" area, increase */
+	  sk->cong_window++;
+	else {
+	  /* in dangerous area, increase slowly.  In theory this is
+	     sk->cong_window += 1 / sk->cong_window
+	   */
+	  if (sk->cong_count >= sk->cong_window) {
+	    sk->cong_window++;
+	    sk->cong_count = 0;
+	  } else 
+	    sk->cong_count++;
+	}
   }
 
   DPRINTF((DBG_TCP, "tcp_ack: Updating rcv ack sequence.\n"));
   sk->rcv_ack_seq = ack;
+
+  /*
+   * if this ack opens up a zero window, clear backoff.  It was
+   * being used to time the probes, and is probably far higher than
+   * it needs to be for normal retransmission
+   */
+  if (sk->timeout == TIME_PROBE0) {
+  	if (sk->wfront != NULL &&   /* should always be non-null */
+	    ! before (sk->window_seq, sk->wfront->h.seq)) {
+	  sk->retransmits = 0;
+	  sk->backoff = 0;
+	  /* recompute rto from rtt.  this eliminates any backoff */
+	  sk->rto = ((sk->rtt >> 2) + sk->mdev) >> 1;
+	  if (sk->rto > 120*HZ)
+	    sk->rto = 120*HZ;
+	  if (sk->rto < 1*HZ)
+	    sk->rto = 1*HZ;
+	}
+  }
 
   /* See if we can take anything off of the retransmit queue. */
   while(sk->send_head != NULL) {
@@ -2264,7 +2448,37 @@ tcp_ack(struct sock *sk, struct tcphdr *th, unsigned long saddr, int len)
 	if (before(sk->send_head->h.seq, ack+1)) {
 		struct sk_buff *oskb;
 
-		sk->retransmits = 0;
+		if (sk->retransmits) {
+
+		  /* we were retransmitting.  don't count this in RTT est */
+		  flag |= 2;
+
+		  /*
+		   * even though we've gotten an ack, we're still
+		   * retransmitting as long as we're sending from
+		   * the retransmit queue.  Keeping retransmits non-zero
+		   * prevents us from getting new data interspersed with
+		   * retransmissions.
+		   */
+
+		  if (sk->send_head->link3)
+		    sk->retransmits = 1;
+		  else
+		    sk->retransmits = 0;
+
+		}
+
+  		/*
+		 * Note that we only reset backoff and rto in the
+		 * rtt recomputation code.  And that doesn't happen
+		 * if there were retransmissions in effect.  So the
+		 * first new packet after the retransmissions is
+		 * sent with the backoff still in effect.  Not until
+		 * we get an ack from a non-retransmitted packet do
+		 * we reset the backoff and rto.  This allows us to deal
+		 * with a situation where the network delay has increased
+		 * suddenly.  I.e. Karn's algorithm. (SIGCOMM '87, p5.)
+		 */
 
 		/* We have one less packet out there. */
 		if (sk->packets_out > 0) sk->packets_out --;
@@ -2272,29 +2486,38 @@ tcp_ack(struct sock *sk, struct tcphdr *th, unsigned long saddr, int len)
 				sk->send_head, sk->send_head->h.seq, ack));
 
 		/* Wake up the process, it can probably write more. */
-		if (!sk->dead) wake_up(sk->sleep);
+		if (!sk->dead) sk->write_space(sk);
 
 		oskb = sk->send_head;
 
-		/* Estimate the RTT. Ignore the ones right after a retransmit. */
-		if (sk->retransmits == 0 && !(flag&2)) {
-		  long abserr, rtt = jiffies - oskb->when;
+		if (!(flag&2)) {
+		  long m;
 
-		  if (sk->state == TCP_SYN_SENT || sk->state == TCP_SYN_RECV)
-		    /* first ack, so nothing else to average with */
-		    sk->rtt = rtt;
-		  else {
-		    abserr = (rtt > sk->rtt) ? rtt - sk->rtt : sk->rtt - rtt;
-		    sk->rtt = (7 * sk->rtt + rtt) >> 3;
-		    sk->mdev = (3 * sk->mdev + abserr) >> 2;
-		  }
+		  /* The following amusing code comes from Jacobson's
+		   * article in SIGCOMM '88.  Note that rtt and mdev
+		   * are scaled versions of rtt and mean deviation.
+		   * This is designed to be as fast as possible 
+		   * m stands for "measurement".
+		   */
+
+		  m = jiffies - oskb->when;  /* RTT */
+		  m -= (sk->rtt >> 3);       /* m is now error in rtt est */
+		  sk->rtt += m;              /* rtt = 7/8 rtt + 1/8 new */
+		  if (m < 0)
+		    m = -m;		     /* m is now abs(error) */
+		  m -= (sk->mdev >> 2);      /* similar update on mdev */
+		  sk->mdev += m;	     /* mdev = 3/4 mdev + 1/4 new */
+
+		  /* now update timeout.  Note that this removes any backoff */
+		  sk->rto = ((sk->rtt >> 2) + sk->mdev) >> 1;
+		  if (sk->rto > 120*HZ)
+		    sk->rto = 120*HZ;
+		  if (sk->rto < 1*HZ)
+		    sk->rto = 1*HZ;
 		  sk->backoff = 0;
+
 		}
 		flag |= (2|4);
-		/* no point retransmitting faster than .1 sec */
-		/* 2 minutes is max legal rtt for Internet */
-		if (sk->rtt < 10) sk->rtt = 10;
-		if (sk->rtt > 12000) sk->rtt = 12000;
 
 		cli();
 
@@ -2310,7 +2533,7 @@ tcp_ack(struct sock *sk, struct tcphdr *th, unsigned long saddr, int len)
 		sti();
 		oskb->magic = 0;
 		kfree_skb(oskb, FREE_WRITE); /* write. */
-		if (!sk->dead) wake_up(sk->sleep);
+		if (!sk->dead) sk->write_space(sk);
 	} else {
 		break;
 	}
@@ -2321,16 +2544,24 @@ tcp_ack(struct sock *sk, struct tcphdr *th, unsigned long saddr, int len)
    * and put it onto the xmit queue.
    */
   if (sk->wfront != NULL) {
-	if (after (sk->window_seq, sk->wfront->h.seq) &&
-		sk->packets_out < sk->cong_window) {
+	if (after (sk->window_seq+1, sk->wfront->h.seq) &&
+	        (sk->retransmits == 0 || 
+		 sk->timeout != TIME_WRITE ||
+		 before(sk->wfront->h.seq, sk->rcv_ack_seq +1))
+		&& sk->packets_out < sk->cong_window) {
 		flag |= 1;
 		tcp_write_xmit(sk);
-	}
+ 	} else if (before(sk->window_seq, sk->wfront->h.seq) &&
+ 		   sk->send_head == NULL &&
+ 		   sk->ack_backlog == 0 &&
+ 		   sk->state != TCP_TIME_WAIT) {
+ 	        reset_timer(sk, TIME_PROBE0, sk->rto);
+ 	}		
   } else {
 	if (sk->send_head == NULL && sk->ack_backlog == 0 &&
 	    sk->state != TCP_TIME_WAIT && !sk->keepopen) {
 		DPRINTF((DBG_TCP, "Nothing to do, going to sleep.\n")); 
-		if (!sk->dead) wake_up(sk->sleep);
+		if (!sk->dead) sk->write_space(sk);
 
 		if (sk->keepopen)
 			reset_timer(sk, TIME_KEEPOPEN, TCP_TIMEOUT_LEN);
@@ -2338,8 +2569,7 @@ tcp_ack(struct sock *sk, struct tcphdr *th, unsigned long saddr, int len)
 			delete_timer(sk);
 	} else {
 		if (sk->state != (unsigned char) sk->keepopen) {
-			reset_timer(sk, TIME_WRITE,
-			  backoff(sk->backoff) * (2 * sk->mdev + sk->rtt));
+			reset_timer(sk, TIME_WRITE, sk->rto);
 		}
 		if (sk->state == TCP_TIME_WAIT) {
 			reset_timer(sk, TIME_CLOSE, TCP_TIMEWAIT_LEN);
@@ -2347,7 +2577,7 @@ tcp_ack(struct sock *sk, struct tcphdr *th, unsigned long saddr, int len)
 	}
   }
 
-  if (sk->packets_out == 0 && sk->send_tmp != NULL &&
+  if (sk->packets_out == 0 && sk->partial != NULL &&
       sk->wfront == NULL && sk->send_head == NULL) {
 	flag |= 1;
 	tcp_send_partial(sk);
@@ -2355,7 +2585,8 @@ tcp_ack(struct sock *sk, struct tcphdr *th, unsigned long saddr, int len)
 
   /* See if we are done. */
   if (sk->state == TCP_TIME_WAIT) {
-	if (!sk->dead) wake_up(sk->sleep);
+	if (!sk->dead)
+		sk->state_change(sk);
 	if (sk->rcv_ack_seq == sk->send_seq && sk->acked_seq == sk->fin_seq) {
 		flag |= 1;
 		sk->state = TCP_CLOSE;
@@ -2364,7 +2595,7 @@ tcp_ack(struct sock *sk, struct tcphdr *th, unsigned long saddr, int len)
   }
 
   if (sk->state == TCP_LAST_ACK || sk->state == TCP_FIN_WAIT2) {
-	if (!sk->dead) wake_up(sk->sleep);
+	if (!sk->dead) sk->state_change(sk);
 	if (sk->rcv_ack_seq == sk->send_seq) {
 		flag |= 1;
 		if (sk->acked_seq != sk->fin_seq) {
@@ -2379,12 +2610,41 @@ tcp_ack(struct sock *sk, struct tcphdr *th, unsigned long saddr, int len)
 	}
   }
 
+/*
+ * I make no guarantees about the first clause in the following
+ * test, i.e. "(!flag) || (flag&4)".  I'm not entirely sure under
+ * what conditions "!flag" would be true.  However I think the rest
+ * of the conditions would prevent that from causing any
+ * unnecessary retransmission. 
+ *   Clearly if the first packet has expired it should be 
+ * retransmitted.  The other alternative, "flag&2 && retransmits", is
+ * harder to explain:  You have to look carefully at how and when the
+ * timer is set and with what timeout.  The most recent transmission always
+ * sets the timer.  So in general if the most recent thing has timed
+ * out, everything before it has as well.  So we want to go ahead and
+ * retransmit some more.  If we didn't explicitly test for this
+ * condition with "flag&2 && retransmits", chances are "when + rto < jiffies"
+ * would not be true.  If you look at the pattern of timing, you can
+ * show that rto is increased fast enough that the next packet would
+ * almost never be retransmitted immediately.  Then you'd end up
+ * waiting for a timeout to send each packet on the retranmission
+ * queue.  With my implementation of the Karn sampling algorithm,
+ * the timeout would double each time.  The net result is that it would
+ * take a hideous amount of time to recover from a single dropped packet.
+ * It's possible that there should also be a test for TIME_WRITE, but
+ * I think as long as "send_head != NULL" and "retransmit" is on, we've
+ * got to be in real retransmission mode.
+ *   Note that ip_do_retransmit is called with all==1.  Setting cong_window
+ * back to 1 at the timeout will cause us to send 1, then 2, etc. packets.
+ * As long as no further losses occur, this seems reasonable.
+ */
+
   if (((!flag) || (flag&4)) && sk->send_head != NULL &&
-      (sk->send_head->when + backoff(sk->backoff) * (2 * sk->mdev + sk->rtt)
-       < jiffies)) {
-	sk->exp_growth = 0;
-	ip_retransmit(sk, 0);
-  }
+      (((flag&2) && sk->retransmits) ||
+       (sk->send_head->when + sk->rto < jiffies))) {
+	ip_do_retransmit(sk, 1);
+	reset_timer(sk, TIME_WRITE, sk->rto);
+      }
 
   DPRINTF((DBG_TCP, "leaving tcp_ack\n"));
   return(1);
@@ -2421,13 +2681,13 @@ tcp_data(struct sk_buff *skb, struct sock *sk,
   if (sk->shutdown & RCV_SHUTDOWN) {
 	sk->acked_seq = th->seq + skb->len + th->syn + th->fin;
 	tcp_reset(sk->saddr, sk->daddr, skb->h.th,
-	sk->prot, NULL, skb->dev);
+	sk->prot, NULL, skb->dev, sk->ip_tos, sk->ip_ttl);
 	sk->state = TCP_CLOSE;
 	sk->err = EPIPE;
 	sk->shutdown = SHUTDOWN_MASK;
 	DPRINTF((DBG_TCP, "tcp_data: closing socket - %X\n", sk));
 	kfree_skb(skb, FREE_READ);
-	if (!sk->dead) wake_up(sk->sleep);
+	if (!sk->dead) sk->state_change(sk);
 	return(0);
   }
 
@@ -2523,7 +2783,7 @@ tcp_data(struct sk_buff *skb, struct sock *sk,
 
 		/* When we ack the fin, we turn on the RCV_SHUTDOWN flag. */
 		if (skb->h.th->fin) {
-			if (!sk->dead) wake_up(sk->sleep);
+			if (!sk->dead) sk->state_change(sk);
 			sk->shutdown |= RCV_SHUTDOWN;
 		}
 	  
@@ -2532,7 +2792,18 @@ tcp_data(struct sk_buff *skb, struct sock *sk,
 		    skb2 = (struct sk_buff *)skb2->next) {
 			if (before(skb2->h.th->seq, sk->acked_seq+1)) {
 				if (after(skb2->h.th->ack_seq, sk->acked_seq))
+				{
+					long old_acked_seq = sk->acked_seq;
 					sk->acked_seq = skb2->h.th->ack_seq;
+					if((int)(sk->acked_seq - old_acked_seq) >0)
+					{
+						int new_window=sk->window-sk->acked_seq+
+							old_acked_seq;
+						if(new_window<0)
+							new_window=0;
+						sk->window = new_window;
+					}
+				}
 				skb2->acked = 1;
 
 				/*
@@ -2541,7 +2812,7 @@ tcp_data(struct sk_buff *skb, struct sock *sk,
 				 */
 				if (skb2->h.th->fin) {
 					sk->shutdown |= RCV_SHUTDOWN;
-					if (!sk->dead) wake_up(sk->sleep);
+					if (!sk->dead) sk->state_change(sk);
 				}
 
 				/* Force an immediate ack. */
@@ -2576,7 +2847,8 @@ tcp_data(struct sk_buff *skb, struct sock *sk,
 	/*
 	 * This is important.  If we don't have much room left,
 	 * we need to throw out a few packets so we have a good
-	 * window.
+	 * window.  Note that mtu is used, not mss, because mss is really
+	 * for the send side.  He could be sending us stuff as large as mtu.
 	 */
 	while (sk->prot->rspace(sk) < sk->mtu) {
 		skb1 = skb_peek(&sk->rqueue);
@@ -2614,7 +2886,7 @@ tcp_data(struct sk_buff *skb, struct sock *sk,
   if (!sk->dead) {
         if(sk->debug)
         	printk("Data wakeup.\n");
-	wake_up(sk->sleep);
+	sk->data_ready(sk,0);
   } else {
 	DPRINTF((DBG_TCP, "data received on dead socket.\n"));
   }
@@ -2626,7 +2898,7 @@ tcp_data(struct sk_buff *skb, struct sock *sk,
 /*	tcp_send_ack(sk->send_seq, sk->acked_seq, sk, th, saddr); */
 	sk->shutdown = SHUTDOWN_MASK;
 	sk->state = TCP_LAST_ACK;
-	if (!sk->dead) wake_up(sk->sleep);
+	if (!sk->dead) sk->state_change(sk);
   }
 
   return(0);
@@ -2639,7 +2911,8 @@ tcp_urg(struct sock *sk, struct tcphdr *th, unsigned long saddr)
   extern int kill_pg(int pg, int sig, int priv);
   extern int kill_proc(int pid, int sig, int priv);
     
-  if (!sk->dead) wake_up(sk->sleep);
+  if (!sk->dead) 
+  	sk->data_ready(sk,0);
     
   if (sk->urginline) {
 	th->urg = 0;
@@ -2662,7 +2935,7 @@ tcp_urg(struct sock *sk, struct tcphdr *th, unsigned long saddr)
 }
 
 
-/* This deals with incoming fins. */
+/* This deals with incoming fins. 'Linus at 9 O'clock' 8-) */
 static int
 tcp_fin(struct sock *sk, struct tcphdr *th, 
 	 unsigned long saddr, struct device *dev)
@@ -2671,7 +2944,7 @@ tcp_fin(struct sock *sk, struct tcphdr *th,
 						sk, th, saddr, dev));
   
   if (!sk->dead) {
-	wake_up(sk->sleep);
+	sk->state_change(sk);
   }
 
   switch(sk->state) {
@@ -2790,15 +3063,20 @@ tcp_connect(struct sock *sk, struct sockaddr_in *usin, int addr_len)
 	return(-ENETUNREACH);
   }
   
+  /* Connect back to the same socket: Blows up so disallow it */
+  if(sk->saddr == sin.sin_addr.s_addr && sk->num==ntohs(sin.sin_port))
+	return -EBUSY;
+
   sk->inuse = 1;
   sk->daddr = sin.sin_addr.s_addr;
   sk->send_seq = jiffies * SEQ_TICK - seq_offset;
+  sk->window_seq = sk->send_seq;
   sk->rcv_ack_seq = sk->send_seq -1;
   sk->err = 0;
   sk->dummy_th.dest = sin.sin_port;
   release_sock(sk);
 
-  buff = (struct sk_buff *) sk->prot->wmalloc(sk,MAX_SYN_SIZE,0, GFP_KERNEL);
+  buff = sk->prot->wmalloc(sk,MAX_SYN_SIZE,0, GFP_KERNEL);
   if (buff == NULL) {
 	return(-ENOMEM);
   }
@@ -2808,12 +3086,12 @@ tcp_connect(struct sock *sk, struct sockaddr_in *usin, int addr_len)
   buff->len = 24;
   buff->sk = sk;
   buff->free = 1;
-  t1 = (struct tcphdr *)(buff + 1);
+  t1 = (struct tcphdr *) buff->data;
 
   /* Put in the IP header and routing stuff. */
   /* We need to build the routing stuff fromt the things saved in skb. */
   tmp = sk->prot->build_header(buff, sk->saddr, sk->daddr, &dev,
-					IPPROTO_TCP, NULL, MAX_SYN_SIZE);
+					IPPROTO_TCP, NULL, MAX_SYN_SIZE,sk->ip_tos,sk->ip_ttl);
   if (tmp < 0) {
 	sk->prot->wfree(sk, buff->mem_addr, buff->mem_len);
 	release_sock(sk);
@@ -2836,13 +3114,28 @@ tcp_connect(struct sock *sk, struct sockaddr_in *usin, int addr_len)
   t1->urg_ptr = 0;
   t1->doff = 6;
 
+/* use 512 or whatever user asked for */
+  if (sk->user_mss)
+    sk->mtu = sk->user_mss;
+  else {
+#ifdef SUBNETSARELOCAL
+    if ((sk->saddr ^ sk->daddr) & default_mask(sk->saddr))
+#else
+    if ((sk->saddr ^ sk->daddr) & dev->pa_mask)
+#endif
+      sk->mtu = 576 - HEADER_SIZE;
+    else
+      sk->mtu = MAX_WINDOW;
+  }
+/* but not bigger than device MTU */
+  sk->mtu = min(sk->mtu, dev->mtu - HEADER_SIZE);
+
   /* Put in the TCP options to say MTU. */
   ptr = (unsigned char *)(t1+1);
   ptr[0] = 2;
   ptr[1] = 4;
-  ptr[2] = (dev->mtu- HEADER_SIZE) >> 8;
-  ptr[3] = (dev->mtu- HEADER_SIZE) & 0xff;
-  sk->mtu = dev->mtu - HEADER_SIZE;
+  ptr[2] = (sk->mtu) >> 8;
+  ptr[3] = (sk->mtu) & 0xff;
   tcp_send_check(t1, sk->saddr, sk->daddr,
 		  sizeof(struct tcphdr) + 4, sk);
 
@@ -2862,7 +3155,7 @@ tcp_connect(struct sock *sk, struct sockaddr_in *usin, int addr_len)
 /* This functions checks to see if the tcp header is actually acceptible. */
 static int
 tcp_sequence(struct sock *sk, struct tcphdr *th, short len,
-	     struct options *opt, unsigned long saddr)
+	     struct options *opt, unsigned long saddr, struct device *dev)
 {
   /*
    * This isn't quite right.  sk->acked_seq could be more recent
@@ -2883,6 +3176,19 @@ tcp_sequence(struct sock *sk, struct tcphdr *th, short len,
   DPRINTF((DBG_TCP, "tcp_sequence: rejecting packet.\n"));
 
   /*
+   *	Send a reset if we get something not ours and we are
+   *	unsynchronized. Note: We don't do anything to our end. We
+   *	are just killing the bogus remote connection then we will
+   *	connect again and it will work (with luck).
+   */
+  	 
+  if(sk->state==TCP_SYN_SENT||sk->state==TCP_SYN_RECV)
+  {
+  	tcp_reset(sk->saddr,sk->daddr,th,sk->prot,NULL,dev, sk->ip_tos,sk->ip_ttl);
+  	return(1);
+  }
+
+  /*
    * If it's too far ahead, send an ack to let the
    * other end know what we expect.
    */
@@ -2892,10 +3198,19 @@ tcp_sequence(struct sock *sk, struct tcphdr *th, short len,
 	return(0);
   }
 
+#ifdef undef
+/*
+ * if we do this, we won't respond to keepalive packets, since those
+ * are slightly out of window, and we have to generate an ack
+ * a late ack out still not to have a sequence number less than
+ * one we've seen before.  Berkeley doesn't seem to do this, but it's
+ * always hard to be sure.
+ */
   /* In case it's just a late ack, let it through. */
   if (th->ack && len == (th->doff * 4) &&
       after(th->seq, sk->acked_seq - 32767) &&
       !th->fin && !th->syn) return(1);
+#endif
 
   if (!th->rst) {
 	/* Try to resync things. */
@@ -2969,7 +3284,7 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_rcv: bad checksum\n");
 		{	
 			th->seq = ntohl(th->seq);
 			/* So reset is always called with th->seq in host order */
-			tcp_reset(daddr, saddr, th, &tcp_prot, opt,dev);
+			tcp_reset(daddr, saddr, th, &tcp_prot, opt,dev,skb->ip_hdr->tos,255);
 		}
 		skb->sk = NULL;
 		kfree_skb(skb, FREE_READ);
@@ -3042,7 +3357,7 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_rcv: bad checksum\n");
  			sk->state = TCP_CLOSE;
 			sk->shutdown = SHUTDOWN_MASK;
 			if (!sk->dead) {
-				wake_up(sk->sleep);
+				sk->state_change(sk);
 			}
 			kfree_skb(skb, FREE_READ);
 			release_sock(sk);
@@ -3054,11 +3369,14 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_rcv: bad checksum\n");
 	case TCP_FIN_WAIT1:
 	case TCP_FIN_WAIT2:
 	case TCP_TIME_WAIT:
-		if (!tcp_sequence(sk, th, len, opt, saddr)) {
+		if (!tcp_sequence(sk, th, len, opt, saddr,dev)) {
 if (inet_debug == DBG_SLIP) printk("\rtcp_rcv: not in seq\n");
+#ifdef undef
+/* nice idea, but tcp_sequence already does this.  Maybe it shouldn't?? */
 			if(!th->rst)
 				tcp_send_ack(sk->send_seq, sk->acked_seq, 
 				     sk, th, saddr);
+#endif
 			kfree_skb(skb, FREE_READ);
 			release_sock(sk);
 			return(0);
@@ -3077,33 +3395,32 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_rcv: not in seq\n");
 			 * A reset with a fin just means that
 			 * the data was not all read.
 			 */
-/* The comment above appears completely bogus --clh */
-/*			if (!th->fin) { */
-				sk->state = TCP_CLOSE;
-				sk->shutdown = SHUTDOWN_MASK;
-				if (!sk->dead) {
-					wake_up(sk->sleep);
-				}
-				kfree_skb(skb, FREE_READ);
-				release_sock(sk);
-				return(0);
-/*			} */
-		}
-#if 0
-		if (opt && (opt->security != 0 ||
-			    opt->compartment != 0 || th->syn)) {
-			sk->err = ECONNRESET;
 			sk->state = TCP_CLOSE;
 			sk->shutdown = SHUTDOWN_MASK;
-			tcp_reset(daddr, saddr,  th, sk->prot, opt,dev);
 			if (!sk->dead) {
-				wake_up(sk->sleep);
+				sk->state_change(sk);
 			}
 			kfree_skb(skb, FREE_READ);
 			release_sock(sk);
 			return(0);
 		}
+		if (
+#if 0
+		if ((opt && (opt->security != 0 ||
+			    opt->compartment != 0)) || 
 #endif
+				 th->syn) {
+			sk->err = ECONNRESET;
+			sk->state = TCP_CLOSE;
+			sk->shutdown = SHUTDOWN_MASK;
+			tcp_reset(daddr, saddr,  th, sk->prot, opt,dev, sk->ip_tos,sk->ip_ttl);
+			if (!sk->dead) {
+				sk->state_change(sk);
+			}
+			kfree_skb(skb, FREE_READ);
+			release_sock(sk);
+			return(0);
+		}
 		if (th->ack) {
 			if (!tcp_ack(sk, th, saddr, len)) {
 				kfree_skb(skb, FREE_READ);
@@ -3119,13 +3436,14 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_rcv: not in seq\n");
 			}
 		}
 
-		if (th->fin && tcp_fin(sk, th, saddr, dev)) {
+		if (tcp_data(skb, sk, saddr, len)) {
 			kfree_skb(skb, FREE_READ);
 			release_sock(sk);
 			return(0);
 		}
 
-		if (tcp_data(skb, sk, saddr, len)) {
+		/* Moved: you must do data then fin bit */
+		if (th->fin && tcp_fin(sk, th, saddr, dev)) {
 			kfree_skb(skb, FREE_READ);
 			release_sock(sk);
 			return(0);
@@ -3145,7 +3463,7 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_rcv: not in seq\n");
 		if (!th->rst) {
 			if (!th->ack)
 				th->ack_seq = 0;
-			tcp_reset(daddr, saddr, th, sk->prot, opt,dev);
+			tcp_reset(daddr, saddr, th, sk->prot, opt,dev,sk->ip_tos,sk->ip_ttl);
 		}
 		kfree_skb(skb, FREE_READ);
 		release_sock(sk);
@@ -3158,7 +3476,7 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_rcv: not in seq\n");
 			return(0);
 		}
 		if (th->ack) {
-			tcp_reset(daddr, saddr, th, sk->prot, opt,dev);
+			tcp_reset(daddr, saddr, th, sk->prot, opt,dev,sk->ip_tos,sk->ip_ttl);
 			kfree_skb(skb, FREE_READ);
 			release_sock(sk);
 			return(0);
@@ -3189,7 +3507,7 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_rcv: not in seq\n");
 		return(0);
 
 	default:
-		if (!tcp_sequence(sk, th, len, opt, saddr)) {
+		if (!tcp_sequence(sk, th, len, opt, saddr,dev)) {
 			kfree_skb(skb, FREE_READ);
 			release_sock(sk);
 			return(0);
@@ -3202,7 +3520,7 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_rcv: not in seq\n");
 			sk->shutdown = SHUTDOWN_MASK;
 			sk->zapped = 1;
 			if (!sk->dead) {
-				wake_up(sk->sleep);
+				sk->state_change(sk);
 			}
 			kfree_skb(skb, FREE_READ);
 			release_sock(sk);
@@ -3215,7 +3533,7 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_rcv: not in seq\n");
 			sk->shutdown = SHUTDOWN_MASK;
 			tcp_reset(daddr, saddr,  th, sk->prot, opt, dev);
 			if (!sk->dead) {
-				wake_up(sk->sleep);
+				wake_up_interruptible(sk->sleep);
 			}
 			kfree_skb(skb, FREE_READ);
 			release_sock(sk);
@@ -3236,7 +3554,7 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_rcv: not in seq\n");
 			case TCP_SYN_SENT:
 				if (!tcp_ack(sk, th, saddr, len)) {
 					tcp_reset(daddr, saddr, th,
-							sk->prot, opt,dev);
+							sk->prot, opt,dev,sk->ip_tos,sk->ip_ttl);
 					kfree_skb(skb, FREE_READ);
 					release_sock(sk);
 					return(0);
@@ -3261,7 +3579,7 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_rcv: not in seq\n");
 			case TCP_SYN_RECV:
 				if (!tcp_ack(sk, th, saddr, len)) {
 					tcp_reset(daddr, saddr, th,
-							sk->prot, opt, dev);
+							sk->prot, opt, dev,sk->ip_tos,sk->ip_ttl);
 					kfree_skb(skb, FREE_READ);
 					release_sock(sk);
 					return(0);
@@ -3277,7 +3595,21 @@ if (inet_debug == DBG_SLIP) printk("\rtcp_rcv: not in seq\n");
 				sk->dummy_th.dest = th->source;
 				sk->copied_seq = sk->acked_seq-1;
 				if (!sk->dead) {
-					wake_up(sk->sleep);
+					sk->state_change(sk);
+				}
+
+				/*
+				 * We've already processed his first
+				 * ack.  In just about all cases that
+				 * will have set max_window.  This is
+				 * to protect us against the possibility
+				 * that the initial window he sent was 0.
+				 * This must occur after tcp_options, which
+				 * sets sk->mtu.
+				 */
+				if (sk->max_window == 0) {
+				  sk->max_window = 32;
+				  sk->mss = min(sk->max_window, sk->mtu);
 				}
 
 				/*
@@ -3341,7 +3673,7 @@ tcp_write_wakeup(struct sock *sk)
 
   if (sk -> state != TCP_ESTABLISHED && sk->state != TCP_CLOSE_WAIT) return;
 
-  buff = (struct sk_buff *) sk->prot->wmalloc(sk,MAX_ACK_SIZE,1, GFP_ATOMIC);
+  buff = sk->prot->wmalloc(sk,MAX_ACK_SIZE,1, GFP_ATOMIC);
   if (buff == NULL) return;
 
   buff->mem_addr = buff;
@@ -3350,11 +3682,11 @@ tcp_write_wakeup(struct sock *sk)
   buff->free = 1;
   buff->sk = sk;
   DPRINTF((DBG_TCP, "in tcp_write_wakeup\n"));
-  t1 = (struct tcphdr *)(buff + 1);
+  t1 = (struct tcphdr *) buff->data;
 
   /* Put in the IP header and routing stuff. */
   tmp = sk->prot->build_header(buff, sk->saddr, sk->daddr, &dev,
-				IPPROTO_TCP, sk->opt, MAX_ACK_SIZE);
+				IPPROTO_TCP, sk->opt, MAX_ACK_SIZE,sk->ip_tos,sk->ip_ttl);
   if (tmp < 0) {
 	sk->prot->wfree(sk, buff->mem_addr, buff->mem_len);
 	return;
@@ -3379,7 +3711,7 @@ tcp_write_wakeup(struct sock *sk)
   t1->fin = 0;
   t1->syn = 0;
   t1->ack_seq = ntohl(sk->acked_seq);
-  t1->window = ntohs(sk->prot->rspace(sk));
+  t1->window = ntohs(tcp_select_window(sk)/*sk->prot->rspace(sk)*/);
   t1->doff = sizeof(*t1)/4;
   tcp_send_check(t1, sk->saddr, sk->daddr, sizeof(*t1), sk);
 
@@ -3388,6 +3720,169 @@ tcp_write_wakeup(struct sock *sk)
   */
   sk->prot->queue_xmit(sk, dev, buff, 1);
 }
+
+/*
+ * This routine probes a zero window.  It makes a copy of the first
+ * packet in the write queue, but with just one byte of data.
+ */
+void
+tcp_send_probe0(struct sock *sk)
+{
+  unsigned char *raw;
+  struct iphdr *iph;
+  struct sk_buff *skb2, *skb;
+  int len, hlen, data;
+  struct tcphdr *t1;
+  struct device *dev;
+
+  if (sk->zapped)
+	return;	/* Afer a valid reset we can send no more */
+
+  if (sk -> state != TCP_ESTABLISHED && sk->state != TCP_CLOSE_WAIT &&
+      sk -> state != TCP_FIN_WAIT1 && sk->state != TCP_FIN_WAIT2)
+  	return;
+
+  skb = sk->wfront;
+  if (skb == NULL)
+        return;
+
+  dev = skb->dev;
+  /* I know this can't happen but as it does.. */
+  if(dev==NULL)
+    {
+      printk("tcp_send_probe0: NULL device bug!\n");
+      return;
+    }
+  IS_SKB(skb);
+
+  raw = skb->data;
+  iph = (struct iphdr *) (raw + dev->hard_header_len);
+
+  hlen = (iph->ihl * sizeof(unsigned long)) + dev->hard_header_len;
+  data = skb->len - hlen - sizeof(struct tcphdr);
+  len = hlen + sizeof(struct tcphdr) + (data ? 1 : 0);
+ 	
+  /* Allocate buffer. */
+  if ((skb2 = alloc_skb(sizeof(struct sk_buff) + len, GFP_ATOMIC)) == NULL) {
+/*    printk("alloc failed raw %x th %x hlen %d data %d len %d\n",
+	   raw, skb->h.th, hlen, data, len); */
+    reset_timer (sk, TIME_PROBE0, 10);  /* try again real soon */
+    return;
+  }
+
+  skb2->arp = skb->arp;
+  skb2->len = len;
+  skb2->h.raw = (char *)(skb2->data);
+ 
+  sk->wmem_alloc += skb2->mem_len;
+ 
+  /* Copy the packet header into the new buffer. */
+  memcpy(skb2->h.raw, raw, len);
+ 
+  skb2->h.raw += hlen;  /* it's now h.th -- pointer to the tcp header */
+  t1 = skb2->h.th;
+ 
+/* source, dest, seq, from existing packet */
+  t1->ack_seq = ntohl(sk->acked_seq);
+  t1->res1 = 0;
+/* doff, fin, from existing packet.  Fin is safe because Linux always
+ * sends fin in a separate packet
+ * syn, rst, had better be zero in original */
+  t1->ack = 1;
+  t1->urg = 0;  /* urgent pointer might be beyond this fragment */
+  t1->res2 = 0;
+  t1->window = ntohs(tcp_select_window(sk)/*sk->prot->rspace(sk)*/);
+  t1->urg_ptr = 0;
+  tcp_send_check(t1, sk->saddr, sk->daddr, len - hlen, sk);
+  /* Send it and free it.
+   * This will prevent the timer from automatically being restarted.
+   */
+  sk->prot->queue_xmit(sk, dev, skb2, 1);
+  sk->backoff++;
+  /*
+   * in the case of retransmissions, there's good reason to limit
+   * rto to 120 sec, as that's the maximum legal RTT on the Internet.
+   * For probes it could reasonably be longer.  However making it
+   * much longer could cause unacceptable delays in some situation,
+   * so we might as well use the same value
+   */
+  sk->rto = min(sk->rto << 1, 120*HZ);
+  reset_timer (sk, TIME_PROBE0, sk->rto);
+  sk->retransmits++;
+  sk->prot->retransmits ++;
+}
+
+/*
+ *	Socket option code for TCP. 
+ */
+  
+int tcp_setsockopt(struct sock *sk, int level, int optname, char *optval, int optlen)
+{
+	int val,err;
+
+	if(level!=SOL_TCP)
+		return ip_setsockopt(sk,level,optname,optval,optlen);
+
+  	if (optval == NULL) 
+  		return(-EINVAL);
+
+  	err=verify_area(VERIFY_READ, optval, sizeof(int));
+  	if(err)
+  		return err;
+  	
+  	val = get_fs_long((unsigned long *)optval);
+
+	switch(optname)
+	{
+		case TCP_MAXSEG:
+/*			if(val<200||val>2048 || val>sk->mtu) */
+/*
+ * values greater than interface MTU won't take effect.  however at
+ * the point when this call is done we typically don't yet know
+ * which interface is going to be used
+ */
+	  		if(val<1||val>MAX_WINDOW)
+				return -EINVAL;
+			sk->user_mss=val;
+			return 0;
+		case TCP_NODELAY:
+			sk->nonagle=(val==0)?0:1;
+			return 0;
+		default:
+			return(-ENOPROTOOPT);
+	}
+}
+
+int tcp_getsockopt(struct sock *sk, int level, int optname, char *optval, int *optlen)
+{
+	int val,err;
+
+	if(level!=SOL_TCP)
+		return ip_getsockopt(sk,level,optname,optval,optlen);
+			
+	switch(optname)
+	{
+		case TCP_MAXSEG:
+			val=sk->user_mss;
+			break;
+		case TCP_NODELAY:
+			val=sk->nonagle;	/* Until Johannes stuff is in */
+			break;
+		default:
+			return(-ENOPROTOOPT);
+	}
+	err=verify_area(VERIFY_WRITE, optlen, sizeof(int));
+	if(err)
+  		return err;
+  	put_fs_long(sizeof(int),(unsigned long *) optlen);
+
+  	err=verify_area(VERIFY_WRITE, optval, sizeof(int));
+  	if(err)
+  		return err;
+  	put_fs_long(val,(unsigned long *)optval);
+
+  	return(0);
+}	
 
 
 struct proto tcp_prot = {
@@ -3414,6 +3909,8 @@ struct proto tcp_prot = {
   tcp_ioctl,
   NULL,
   tcp_shutdown,
+  tcp_setsockopt,
+  tcp_getsockopt,
   128,
   0,
   {NULL,},

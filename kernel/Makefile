@@ -17,7 +17,7 @@
 	$(CC) $(CFLAGS) -c $<
 
 OBJS  = sched.o sys_call.o traps.o irq.o dma.o fork.o \
-	panic.o printk.o vsprintf.o sys.o exit.o \
+ 	panic.o printk.o vsprintf.o sys.o module.o ksyms.o exit.o \
 	signal.o mktime.o ptrace.o ioport.o itimer.o \
 	info.o ldt.o time.o
 
@@ -33,6 +33,14 @@ sys_call.o: sys_call.s
 
 sched.o: sched.c
 	$(CC) $(CFLAGS) $(PROFILING) -fno-omit-frame-pointer -c $<
+
+ksyms.lst: ksyms.S ../include/linux/autoconf.h
+	$(CPP) $(CFLAGS) $< > $@
+ 
+ksyms.s: ksyms.sh ksyms.lst
+	sh $< > $@
+
+ksyms.o: ksyms.s
 
 dep:
 	$(CPP) -M *.c > .depend

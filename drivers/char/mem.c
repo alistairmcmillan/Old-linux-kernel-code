@@ -90,6 +90,8 @@ static int mmap_mem(struct inode * inode, struct file * file,
 
 	if (off & 0xfff || off + len < off)
 		return -ENXIO;
+	if (x86 > 3 && off >= high_memory)
+		prot |= PAGE_PCD;
 	if (remap_page_range(addr, off, len, prot))
 		return -EAGAIN;
 /* try to create a dummy vmm-structure so that the rest of the kernel knows we are here */
@@ -196,13 +198,22 @@ static int mmap_zero(struct inode * inode, struct file * file,
 	mpnt->vm_end = addr + len;
 	mpnt->vm_page_prot = prot;
 	mpnt->vm_share = NULL;
-	mpnt->vm_inode = inode;
-	inode->i_count++;
+	mpnt->vm_inode = NULL;
 	mpnt->vm_offset = off;
 	mpnt->vm_ops = NULL;
 	insert_vm_struct(current, mpnt);
 	merge_segments(current->mmap, ignoff_mergep, inode);
 	return 0;
+}
+
+static int read_full(struct inode * node,struct file * file,char * buf,int count)
+{
+	return count;
+}
+
+static int write_full(struct inode * inode,struct file * file,char * buf, int count)
+{
+	return -ENOSPC;
 }
 
 /*
@@ -321,6 +332,18 @@ static struct file_operations zero_fops = {
 	NULL		/* no special release code */
 };
 
+static struct file_operations full_fops = {
+	memory_lseek,
+	read_full,
+	write_full,
+	NULL,		/* full_readdir */
+	NULL,		/* full_select */
+	NULL,		/* full_ioctl */	
+	NULL,		/* full_mmap */
+	NULL,		/* no special open code */
+	NULL		/* no special release code */
+};
+
 static int memory_open(struct inode * inode, struct file * filp)
 {
 	switch (MINOR(inode->i_rdev)) {
@@ -341,6 +364,9 @@ static int memory_open(struct inode * inode, struct file * filp)
 			break;
 		case 5:
 			filp->f_op = &zero_fops;
+			break;
+		case 7:
+			filp->f_op = &full_fops;
 			break;
 		default:
 			return -ENODEV;
@@ -363,6 +389,10 @@ static struct file_operations memory_fops = {
 	NULL		/* fsync */
 };
 
+#ifdef CONFIG_FTAPE
+char* ftape_big_buffer;
+#endif
+
 long chr_dev_init(long mem_start, long mem_end)
 {
 	if (register_chrdev(MEM_MAJOR,"mem",&memory_fops))
@@ -382,5 +412,15 @@ long chr_dev_init(long mem_start, long mem_end)
 #if CONFIG_TAPE_QIC02
 	mem_start = tape_qic02_init(mem_start);
 #endif
+/*
+ *      Rude way to allocate kernel memory buffer for tape device
+ */
+#ifdef CONFIG_FTAPE
+        /* allocate NR_FTAPE_BUFFERS 32Kb buffers at aligned address */
+        ftape_big_buffer= (char*) ((mem_start + 0x7fff) & ~0x7fff);
+        printk( "ftape: allocated %d buffers alligned at: %p\n",
+               NR_FTAPE_BUFFERS, ftape_big_buffer);
+        mem_start = (long) ftape_big_buffer + NR_FTAPE_BUFFERS * 0x8000;
+#endif 
 	return mem_start;
 }

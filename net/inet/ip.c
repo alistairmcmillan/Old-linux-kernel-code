@@ -29,6 +29,11 @@
  *		Gerhard Koerting:	Forward fragmented frames correctly.
  *		Gerhard Koerting: 	Fixes to my fix of the above 8-).
  *		Gerhard Koerting:	IP interface addressing fix.
+ *		Linus Torvalds	:	More robustness checks
+ *		Alan Cox	:	Even more checks: Still not as robust as it ought to be
+ *		Alan Cox	:	Save IP header pointer for later
+ *		Alan Cox	:	ip option setting
+ *		Alan Cox	:	Use ip_tos/ip_ttl settings
  *
  * To Fix:
  *		IP option processing is mostly not needed. ip_forward needs to know about routing rules
@@ -66,6 +71,8 @@
 
 extern int last_retran;
 extern void sort_send(struct sock *sk);
+
+#define min(a,b)	((a)<(b)?(a):(b))
 
 void
 ip_print(struct iphdr *ip)
@@ -173,7 +180,7 @@ ip_send(struct sk_buff *skb, unsigned long daddr, int len, struct device *dev,
   unsigned char *ptr;
   int mac;
 
-  ptr = (unsigned char *)(skb + 1);
+  ptr = skb->data;
   mac = 0;
   skb->arp = 1;
   if (dev->hard_header) {
@@ -196,7 +203,7 @@ ip_send(struct sk_buff *skb, unsigned long daddr, int len, struct device *dev,
  */
 int
 ip_build_header(struct sk_buff *skb, unsigned long saddr, unsigned long daddr,
-		struct device **dev, int type, struct options *opt, int len)
+		struct device **dev, int type, struct options *opt, int len, int tos, int ttl)
 {
   static struct options optmem;
   struct iphdr *iph;
@@ -213,7 +220,7 @@ ip_build_header(struct sk_buff *skb, unsigned long saddr, unsigned long daddr,
 	   "                 type=%d, opt=%X, len = %d)\n",
 	   skb, saddr, daddr, *dev, type, opt, len));
 	   
-  buff = (unsigned char *)(skb + 1);
+  buff = skb->data;
 
   /* See if we need to look up the device. */
   if (*dev == NULL) {
@@ -254,9 +261,9 @@ ip_build_header(struct sk_buff *skb, unsigned long saddr, unsigned long daddr,
 
   iph = (struct iphdr *)buff;
   iph->version  = 4;
-  iph->tos      = 0;
+  iph->tos      = tos;
   iph->frag_off = 0;
-  iph->ttl      = 32;
+  iph->ttl      = ttl;
   iph->daddr    = daddr;
   iph->saddr    = saddr;
   iph->protocol = type;
@@ -425,19 +432,23 @@ static inline unsigned short
 ip_fast_csum(unsigned char * buff, int wlen)
 {
     unsigned long sum = 0;
-    __asm__("\t clc\n"
-	    "1:\n"
-	    "\t lodsl\n"
-	    "\t adcl %%eax, %%ebx\n"
-	    "\t loop 1b\n"
-	    "\t adcl $0, %%ebx\n"
-	    "\t movl %%ebx, %%eax\n"
-	    "\t shrl $16, %%eax\n"
-	    "\t addw %%ax, %%bx\n"
-	    "\t adcw $0, %%bx\n"
-	    : "=b" (sum) , "=S" (buff)
-	    : "0" (sum), "c" (wlen) ,"1" (buff)
-	    : "ax", "cx", "si", "bx" );
+
+    if (wlen) {
+    	unsigned long bogus;
+	 __asm__("clc\n"
+		"1:\t"
+		"lodsl\n\t"
+		"adcl %3, %0\n\t"
+		"decl %2\n\t"
+		"jne 1b\n\t"
+		"adcl $0, %0\n\t"
+		"movl %0, %3\n\t"
+		"shrl $16, %3\n\t"
+		"addw %w3, %w0\n\t"
+		"adcw $0, %w0"
+	    : "=r" (sum), "=S" (buff), "=r" (wlen), "=a" (bogus)
+	    : "0"  (sum),  "1" (buff),  "2" (wlen));
+    }
     return (~sum) & 0xffff;
 }
 
@@ -452,33 +463,33 @@ ip_compute_csum(unsigned char * buff, int len)
 
   /* Do the first multiple of 4 bytes and convert to 16 bits. */
   if (len > 3) {
-	__asm__("\t clc\n"
-	        "1:\n"
-	        "\t lodsl\n"
-	        "\t adcl %%eax, %%ebx\n"
-	        "\t loop 1b\n"
-	        "\t adcl $0, %%ebx\n"
-	        "\t movl %%ebx, %%eax\n"
-	        "\t shrl $16, %%eax\n"
-	        "\t addw %%ax, %%bx\n"
-	        "\t adcw $0, %%bx\n"
+	__asm__("clc\n"
+	        "1:\t"
+	    	"lodsl\n\t"
+	    	"adcl %%eax, %%ebx\n\t"
+	    	"loop 1b\n\t"
+	    	"adcl $0, %%ebx\n\t"
+	    	"movl %%ebx, %%eax\n\t"
+	    	"shrl $16, %%eax\n\t"
+	    	"addw %%ax, %%bx\n\t"
+	    	"adcw $0, %%bx"
 	        : "=b" (sum) , "=S" (buff)
 	        : "0" (sum), "c" (len >> 2) ,"1" (buff)
 	        : "ax", "cx", "si", "bx" );
   }
   if (len & 2) {
-	__asm__("\t lodsw\n"
-	        "\t addw %%ax, %%bx\n"
-	        "\t adcw $0, %%bx\n"
+	__asm__("lodsw\n\t"
+	    	"addw %%ax, %%bx\n\t"
+	    	"adcw $0, %%bx"
 	        : "=b" (sum), "=S" (buff)
 	        : "0" (sum), "1" (buff)
 	        : "bx", "ax", "si");
   }
   if (len & 1) {
-	__asm__("\t lodsb\n"
-	        "\t movb $0, %%ah\n"
-	        "\t addw %%ax, %%bx\n"
-	        "\t adcw $0, %%bx\n"
+	__asm__("lodsb\n\t"
+	    	"movb $0, %%ah\n\t"
+	    	"addw %%ax, %%bx\n\t"
+	    	"adcw $0, %%bx"
 	        : "=b" (sum), "=S" (buff)
 	        : "0" (sum), "1" (buff)
 	        : "bx", "ax", "si");
@@ -657,7 +668,7 @@ static struct ipq *ip_create(struct sk_buff *skb, struct iphdr *iph, struct devi
  	memset(qp, 0, sizeof(struct ipq));
 
   	/* Allocate memory for the MAC header. */
-  	maclen = ((unsigned long) iph) - ((unsigned long) (skb + 1));
+  	maclen = ((unsigned long) iph) - ((unsigned long) skb->data);
   	qp->mac = (unsigned char *) kmalloc(maclen, GFP_ATOMIC);
   	if (qp->mac == NULL) 
   	{
@@ -678,7 +689,7 @@ static struct ipq *ip_create(struct sk_buff *skb, struct iphdr *iph, struct devi
   	}
 
   	/* Fill in the structure. */
-  	memcpy(qp->mac, (skb + 1), maclen);
+  	memcpy(qp->mac, skb->data, maclen);
  	memcpy(qp->iph, iph, ihlen + 8);
   	qp->len = 0;
   	qp->ihlen = ihlen;
@@ -751,7 +762,7 @@ static struct sk_buff *ip_glue(struct ipq *qp)
  
    	/* Fill in the basic details. */
    	skb->len = (len - qp->maclen);
-   	skb->h.raw = (unsigned char *) (skb + 1);
+   	skb->h.raw = skb->data;
    	skb->free = 1;
    	skb->lock = 1;
  
@@ -791,6 +802,7 @@ static struct sk_buff *ip_glue(struct ipq *qp)
    	iph = skb->h.iph;
    	iph->frag_off = 0;
    	iph->tot_len = htons((iph->ihl * sizeof(unsigned long)) + count);
+   	skb->ip_hdr = iph;
    	return(skb);
 }
  
@@ -845,7 +857,7 @@ static struct sk_buff *ip_defrag(struct iphdr *iph, struct sk_buff *skb, struct 
    	end = offset + ntohs(iph->tot_len) - ihl;
  
    	/* Point into the IP datagram 'data' part. */
-   	ptr = ((unsigned char *) (skb + 1)) + dev->hard_header_len + ihl;
+   	ptr = skb->data + dev->hard_header_len + ihl;
  
    	/* Is this the final fragment? */
    	if ((flags & IP_MF) == 0) 
@@ -957,7 +969,7 @@ static struct sk_buff *ip_defrag(struct iphdr *iph, struct sk_buff *skb, struct 
    	int offset;
  
    	/* Point into the IP datagram header. */
-   	raw = (unsigned char *) (skb + 1);
+   	raw = skb->data;
    	iph = (struct iphdr *) (raw + dev->hard_header_len);
  	
    	/* Setup starting values. */
@@ -1016,7 +1028,7 @@ static struct sk_buff *ip_defrag(struct iphdr *iph, struct sk_buff *skb, struct 
  		skb2->arp = skb->arp;
  		skb2->free = skb->free;
  		skb2->len = len + hlen;
- 		skb2->h.raw=(char *)(skb2+1);
+ 		skb2->h.raw=(char *) skb2->data;
  
  		if (sk) 
  			sk->wmem_alloc += skb2->mem_len;
@@ -1105,6 +1117,7 @@ ip_forward(struct sk_buff *skb, struct device *dev, int is_frag)
 	return;
   }
 
+
   /*
    * Gosh.  Not only is the packet valid; we even know how to
    * forward it onto its final destination.  Can we say this
@@ -1126,6 +1139,9 @@ ip_forward(struct sk_buff *skb, struct device *dev, int is_frag)
   } else raddr = iph->daddr;
   dev2 = rt->rt_dev;
 
+
+  if (dev == dev2)
+	return;
   /*
    * We now allocate a new buffer, and copy the datagram into it.
    * If the indicated interface is up and running, kick it.
@@ -1141,7 +1157,7 @@ ip_forward(struct sk_buff *skb, struct device *dev, int is_frag)
 		printk("\nIP: No memory available for IP forward\n");
 		return;
 	}
-	ptr = (unsigned char *)(skb2 + 1);
+	ptr = skb2->data;
 	skb2->sk = NULL;
 	skb2->free = 1;
 	skb2->len = skb->len + dev2->hard_header_len;
@@ -1185,8 +1201,9 @@ ip_rcv(struct sk_buff *skb, struct device *dev, struct packet_type *pt)
 
   DPRINTF((DBG_IP, "<<\n"));
 
+  skb->ip_hdr = iph;		/* Fragments can cause ICMP errors too! */
   /* Is the datagram acceptable? */
-  if (iph->version != 4 || ip_fast_csum((unsigned char *)iph, iph->ihl) !=0) {
+  if (skb->len<sizeof(struct iphdr) || iph->ihl<5 || iph->version != 4 || ip_fast_csum((unsigned char *)iph, iph->ihl) !=0) {
 	DPRINTF((DBG_IP, "\nIP: *** datagram error ***\n"));
 	DPRINTF((DBG_IP, "    SRC = %s   ", in_ntoa(iph->saddr)));
 	DPRINTF((DBG_IP, "    DST = %s (ignored)\n", in_ntoa(iph->daddr)));
@@ -1257,6 +1274,8 @@ ip_rcv(struct sk_buff *skb, struct device *dev, struct packet_type *pt)
   }
   
   /* Point into the IP datagram, just past the header. */
+
+  skb->ip_hdr = iph;
   skb->h.raw += iph->ihl*4;
   hash = iph->protocol & (MAX_INET_PROTOS -1);
   for (ipprot = (struct inet_protocol *)inet_protos[hash];
@@ -1280,6 +1299,10 @@ ip_rcv(struct sk_buff *skb, struct device *dev, struct packet_type *pt)
 			continue;
 		memcpy(skb2, skb, skb->mem_len);
 		skb2->mem_addr = skb2;
+		skb2->ip_hdr = (struct iphdr *)(
+				(unsigned long)skb2 +
+				(unsigned long) skb->ip_hdr -
+				(unsigned long)skb);
 		skb2->h.raw = (unsigned char *)(
 				(unsigned long)skb2 +
 				(unsigned long) skb->h.raw -
@@ -1343,7 +1366,7 @@ ip_queue_xmit(struct sock *sk, struct device *dev,
   skb->when = jiffies;
   
   DPRINTF((DBG_IP, ">>\n"));
-  ptr = (unsigned char *)(skb + 1);
+  ptr = skb->data;
   ptr += dev->hard_header_len;
   iph = (struct iphdr *)ptr;
   iph->tot_len = ntohs(skb->len-dev->hard_header_len);
@@ -1381,8 +1404,7 @@ ip_queue_xmit(struct sock *sk, struct device *dev,
 		}
 	}
 	sti();
-	reset_timer(sk, TIME_WRITE,
-		backoff(sk->backoff) * (2 * sk->mdev + sk->rtt));
+	reset_timer(sk, TIME_WRITE, sk->rto);
   } else {
 	skb->sk = sk;
   }
@@ -1402,14 +1424,16 @@ ip_queue_xmit(struct sock *sk, struct device *dev,
 
 
 void
-ip_retransmit(struct sock *sk, int all)
+ip_do_retransmit(struct sock *sk, int all)
 {
   struct sk_buff * skb;
   struct proto *prot;
   struct device *dev;
+  int retransmits;
 
   prot = sk->prot;
   skb = sk->send_head;
+  retransmits = sk->retransmits;
   while (skb != NULL) {
 	dev = skb->dev;
 	/* I know this can't happen but as it does.. */
@@ -1430,7 +1454,7 @@ ip_retransmit(struct sock *sk, int all)
 		   the frame in twice. Because of the technique used this
 		   would be a little sad */
 	if (!skb->arp) {
-		if (dev->rebuild_header(skb+1, dev)) {
+		if (dev->rebuild_header(skb->data, dev)) {
 			sti();	/* Failed to rebuild - next */
 			if (!all) break;
 			skb = (struct sk_buff *)skb->link3;
@@ -1443,11 +1467,12 @@ ip_retransmit(struct sock *sk, int all)
 
 	/* If the interface is (still) up and running, kick it. */
 	if (dev->flags & IFF_UP) {
-		if (sk) dev->queue_xmit(skb, dev, sk->priority);
+		if (sk && !skb_device_locked(skb))
+			dev->queue_xmit(skb, dev, sk->priority);
 	/*	  else dev->queue_xmit(skb, dev, SOPRI_NORMAL ); CANNOT HAVE SK=NULL HERE */
 	}
 
-oops:	sk->retransmits++;
+oops:	retransmits++;
 	sk->prot->retransmits ++;
 	if (!all) break;
 
@@ -1455,42 +1480,105 @@ oops:	sk->retransmits++;
 	if (sk->retransmits > sk->cong_window) break;
 	skb = (struct sk_buff *)skb->link3;
   }
+}
+
+/*
+ * This is the normal code called for timeouts.  It does the retransmission
+ * and then does backoff.  ip_do_retransmit is separated out because
+ * tcp_ack needs to send stuff from the retransmit queue without
+ * initiating a backoff.
+ */
+
+void
+ip_retransmit(struct sock *sk, int all)
+{
+  ip_do_retransmit(sk, all);
 
   /*
-   * Increase the RTT time every time we retransmit. 
-   * This will cause exponential back off on how hard we try to
-   * get through again.  Once we get through, the rtt will settle
-   * back down reasonably quickly.
+   * Increase the timeout each time we retransmit.  Note that
+   * we do not increase the rtt estimate.  rto is initialized
+   * from rtt, but increases here.  Jacobson (SIGCOMM 88) suggests
+   * that doubling rto each time is the least we can get away with.
+   * In KA9Q, Karns uses this for the first few times, and then
+   * goes to quadratic.  netBSD doubles, but only goes up to *64,
+   * and clamps at 1 to 64 sec afterwards.  Note that 120 sec is
+   * defined in the protocol as the maximum possible RTT.  I guess
+   * we'll have to use something other than TCP to talk to the
+   * University of Mars.
    */
+
+  sk->retransmits++;
   sk->backoff++;
-  reset_timer(sk, TIME_WRITE, backoff(sk->backoff) * (2 * sk->mdev + sk->rtt));
+  sk->rto = min(sk->rto << 1, 120*HZ);
+  reset_timer(sk, TIME_WRITE, sk->rto);
 }
 
-/* Backoff function - the subject of much research */
-int backoff(int n)
+/*
+ *	Socket option code for IP. This is the end of the line after any TCP,UDP etc options on
+ *	an IP socket.
+ */
+ 
+int ip_setsockopt(struct sock *sk, int level, int optname, char *optval, int optlen)
 {
-	/* Use binary exponential up to retry #4, and quadratic after that
-	 * This yields the sequence
-	 * 1, 2, 4, 8, 16, 25, 36, 49, 64, 81, 100 ...
-	 */
-
-	if(n<0)
-	{
-		printk("Backoff < 0!\n");
-		return 16;	/* Make up a value */
-	}
+	int val,err;
 	
-	if(n <= 4)
-		return 1 << n;	/* Binary exponential back off */
-	else
+  	if (optval == NULL) 
+  		return(-EINVAL);
+
+  	err=verify_area(VERIFY_READ, optval, sizeof(int));
+  	if(err)
+  		return err;
+  	
+  	val = get_fs_long((unsigned long *)optval);
+
+	if(level!=SOL_IP)
+		return -EOPNOTSUPP;
+
+	switch(optname)
 	{
-		if(n<255)
-			return n * n;	/* Quadratic back off */
-		else
-		{
-			printk("Overloaded backoff!\n");
-			return 255*255;
-		}
+		case IP_TOS:
+			if(val<0||val>255)
+				return -EINVAL;
+			sk->ip_tos=val;
+			return 0;
+		case IP_TTL:
+			if(val<1||val>255)
+				return -EINVAL;
+			sk->ip_ttl=val;
+			return 0;
+		/* IP_OPTIONS and friends go here eventually */
+		default:
+			return(-ENOPROTOOPT);
 	}
 }
 
+int ip_getsockopt(struct sock *sk, int level, int optname, char *optval, int *optlen)
+{
+	int val,err;
+	
+	if(level!=SOL_IP)
+		return -EOPNOTSUPP;
+		
+	switch(optname)
+	{
+		case IP_TOS:
+			val=sk->ip_tos;
+			break;
+		case IP_TTL:
+			val=sk->ip_ttl;
+			break;
+		default:
+			return(-ENOPROTOOPT);
+	}
+	err=verify_area(VERIFY_WRITE, optlen, sizeof(int));
+	if(err)
+  		return err;
+  	put_fs_long(sizeof(int),(unsigned long *) optlen);
+
+  	err=verify_area(VERIFY_WRITE, optval, sizeof(int));
+  	if(err)
+  		return err;
+  	put_fs_long(val,(unsigned long *)optval);
+
+  	return(0);
+}

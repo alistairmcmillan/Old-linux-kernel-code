@@ -101,14 +101,20 @@ net_timer (unsigned long data)
   sk->inuse = 1;
 
   DPRINTF ((DBG_TMR, "net_timer: found sk=%X why = %d\n", sk, why));
-  if (sk->keepopen)
+  if (sk->wfront && 
+      before(sk->window_seq, sk->wfront->h.seq) &&
+      sk->send_head == NULL &&
+      sk->ack_backlog == 0 &&
+      sk->state != TCP_TIME_WAIT)
+    reset_timer(sk, TIME_PROBE0, sk->rto);
+  else if (sk->keepopen)
     reset_timer (sk, TIME_KEEPOPEN, TCP_TIMEOUT_LEN);
 
   /* Always see if we need to send an ack. */
   if (sk->ack_backlog) {
     sk->prot->read_wakeup (sk);
     if (! sk->dead)
-      wake_up (sk->sleep);
+      wake_up_interruptible (sk->sleep);
   }
 
   /* Now we need to figure out why the socket was on the timer. */
@@ -141,11 +147,15 @@ net_timer (unsigned long data)
 	sk->state = TCP_CLOSE;
 	delete_timer (sk);
 	/* Kill the ARP entry in case the hardware has changed. */
-	arp_destroy (sk->daddr);
+	arp_destroy_maybe (sk->daddr);
 	if (!sk->dead)
-	  wake_up (sk->sleep);
+	  wake_up_interruptible (sk->sleep);
 	sk->shutdown = SHUTDOWN_MASK;
 	reset_timer (sk, TIME_DESTROY, TCP_DONE_TIME);
+	release_sock (sk);
+	break;
+    case TIME_PROBE0:
+	tcp_send_probe0(sk);
 	release_sock (sk);
 	break;
     case TIME_WRITE:	/* try to retransmit. */
@@ -153,10 +163,9 @@ net_timer (unsigned long data)
 	 * So we need to check for that.
 	 */
 	if (sk->send_head) {
-	  if (jiffies < (sk->send_head->when + backoff (sk->backoff)
-	    * (2 * sk->mdev + sk->rtt))) {
-	    reset_timer (sk, TIME_WRITE, (sk->send_head->when
-		+ backoff (sk->backoff) * (2 * sk->mdev + sk->rtt)) - jiffies);
+	  if (jiffies < (sk->send_head->when + sk->rto)) {
+	    reset_timer (sk, TIME_WRITE, 
+			 (sk->send_head->when + sk->rto - jiffies));
 	    release_sock (sk);
 	    break;
 	  }
@@ -167,7 +176,7 @@ net_timer (unsigned long data)
 	  if ((sk->state == TCP_ESTABLISHED && sk->retransmits && !(sk->retransmits & 7))
 	    || (sk->state != TCP_ESTABLISHED && sk->retransmits > TCP_RETR1)) {
 	    DPRINTF ((DBG_TMR, "timer.c TIME_WRITE time-out 1\n"));
-	    arp_destroy (sk->daddr);
+	    arp_destroy_maybe (sk->daddr);
 	    ip_route_check (sk->daddr);
 	  }
 	  if (sk->state != TCP_ESTABLISHED && sk->retransmits > TCP_RETR2) {
@@ -198,19 +207,19 @@ net_timer (unsigned long data)
 	if ((sk->state == TCP_ESTABLISHED && sk->retransmits && !(sk->retransmits & 7))
 	  || (sk->state != TCP_ESTABLISHED && sk->retransmits > TCP_RETR1)) {
 	  DPRINTF ((DBG_TMR, "timer.c TIME_KEEPOPEN time-out 1\n"));
-	  arp_destroy (sk->daddr);
+	  arp_destroy_maybe (sk->daddr);
 	  ip_route_check (sk->daddr);
 	  release_sock (sk);
 	  break;
 	}
 	if (sk->state != TCP_ESTABLISHED && sk->retransmits > TCP_RETR2) {
 	  DPRINTF ((DBG_TMR, "timer.c TIME_KEEPOPEN time-out 2\n"));
-	  arp_destroy (sk->daddr);
+	  arp_destroy_maybe (sk->daddr);
 	  sk->err = ETIMEDOUT;
 	  if (sk->state == TCP_FIN_WAIT1 || sk->state == TCP_FIN_WAIT2) {
 	    sk->state = TCP_TIME_WAIT;
 	    if (!sk->dead)
-	      wake_up (sk->sleep);
+	      wake_up_interruptible (sk->sleep);
 	    release_sock (sk);
 	  } else {
 	    sk->prot->close (sk, 1);

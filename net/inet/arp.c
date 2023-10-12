@@ -34,6 +34,11 @@
  *		Alan Cox	:	'Bad Packet' only reported on debugging
  *		Alan Cox	:	Proxy arp.
  *		Alan Cox	:	skb->link3 maintained by letting the other xmit queue kill the packet.
+ *		Alan Cox	:	Knows about type 3 devices (AX.25) using an AX.25 protocol ID not the ethernet
+ *					one.
+ *		Dominik Kubla	:	Better checking
+ *		Tegge		:	Assorted corrections on cross port stuff
+ *		Alan Cox	:	ATF_PERM was backwards! - might be useful now (sigh)
  *
  * To Fix:
  *				:	arp response allocates an skbuff to send. However there is a perfectly
@@ -233,7 +238,7 @@ arp_send_q(void)
 
 	/* Can we now complete this packet? */
 	sti();
-	if (skb->arp || !skb->dev->rebuild_header(skb+1, skb->dev)) {
+	if (skb->arp || !skb->dev->rebuild_header(skb->data, skb->dev)) {
 		skb->arp  = 1;
 		skb->dev->queue_xmit(skb, skb->dev, 0);
 	} else {
@@ -282,8 +287,7 @@ arp_response(struct arphdr *arp1, struct device *dev,  int addrtype)
   skb->len      = sizeof(struct arphdr) + (2 * arp1->ar_hln) + 
 		  (2 * arp1->ar_pln) + dev->hard_header_len;
   skb->mem_len  = sizeof(struct sk_buff) + skb->len;
-  hlen = dev->hard_header((unsigned char *)(skb+1), dev,
-			 ETH_P_ARP, src, dst, skb->len);
+  hlen = dev->hard_header(skb->data, dev, ETH_P_ARP, src, dst, skb->len);
   if (hlen < 0) {
 	printk("ARP: cannot create HW frame header for REPLY !\n");
 	kfree_skb(skb, FREE_WRITE);
@@ -295,7 +299,7 @@ arp_response(struct arphdr *arp1, struct device *dev,  int addrtype)
    * This looks ugly, but we have to deal with the variable-length
    * ARP packets and such.  It is not as bad as it looks- FvK
    */
-  arp2 = (struct arphdr *) ((unsigned char *) (skb+1) + hlen);
+  arp2 = (struct arphdr *) (skb->data + hlen);
   ptr2 = ((unsigned char *) &arp2->ar_op) + sizeof(u_short);
   arp2->ar_hrd = arp1->ar_hrd;
   arp2->ar_pro = arp1->ar_pro;
@@ -384,7 +388,7 @@ static struct arp_table *arp_lookup_proxy(unsigned long paddr)
 
 /* Delete an ARP mapping entry in the cache. */
 void
-arp_destroy(unsigned long paddr)
+arp_destructor(unsigned long paddr, int force)
 {
   struct arp_table *apt;
   struct arp_table **lapt;
@@ -404,6 +408,8 @@ arp_destroy(unsigned long paddr)
   lapt = &arp_tables[hash];
   while ((apt = *lapt) != NULL) {
 	if (apt->ip == paddr) {
+		if((apt->flags&ATF_PERM) && !force)
+			return;
 		*lapt = apt->next;
 		if(apt->flags&ATF_PUBL)
 			arp_proxies--;			
@@ -416,6 +422,23 @@ arp_destroy(unsigned long paddr)
   sti();
 }
 
+/*
+ *	Kill an entry - eg for ioctl()
+ */
+
+void arp_destroy(unsigned long paddr)
+{	
+	arp_destructor(paddr,1);
+}
+
+/*
+ *	Delete a possibly invalid entry (see timer.c)
+ */
+
+void arp_destroy_maybe(unsigned long paddr)
+{
+	arp_destructor(paddr,0);
+}
 
 /* Create an ARP entry.  The caller should check for duplicates! */
 static struct arp_table *
@@ -482,7 +505,7 @@ arp_rcv(struct sk_buff *skb, struct device *dev, struct packet_type *pt)
   }
 
   /* For now we will only deal with IP addresses. */
-  if (arp->ar_pro != NET16(ETH_P_IP) || arp->ar_pln != 4) 
+  if (((arp->ar_pro != NET16(0x00CC) && dev->type==3) || (arp->ar_pro != NET16(ETH_P_IP) && dev->type!=3) ) || arp->ar_pln != 4) 
   {
 	if (arp->ar_op != NET16(ARPOP_REQUEST))
 		DPRINTF((DBG_ARP,"ARP: Non-IP request on device \"%s\" !\n", dev->name));
@@ -506,7 +529,7 @@ arp_rcv(struct sk_buff *skb, struct device *dev, struct packet_type *pt)
 	tbl->last_used = jiffies;
   } else {
 	memcpy(&dst, ptr + (arp->ar_hln * 2) + arp->ar_pln, arp->ar_pln);
-	if (chk_addr(dst) != IS_MYADDR) {
+	if (chk_addr(dst) != IS_MYADDR && arp_proxies == 0) {
 		kfree_skb(skb, FREE_READ);
 		return(0);
 	} else {
@@ -534,16 +557,16 @@ arp_rcv(struct sk_buff *skb, struct device *dev, struct packet_type *pt)
 	return(0);
   }
 
-  /*
-   * A broadcast arp, ignore it
-   */
+/*
+ * A broadcast arp, ignore it
+ */
 
-  if((dst&0xFF)==0xFF)
+  if(chk_addr(dst)==IS_BROADCAST)
   {
 	kfree_skb(skb, FREE_READ);
 	return 0;
   }
-
+  
   memcpy(&dst, ptr + (arp->ar_hln * 2) + arp->ar_pln, arp->ar_pln);
   if ((addr_hint=chk_addr(dst)) != IS_MYADDR && arp_proxies==0) {
 	DPRINTF((DBG_ARP, "ARP: request was not for me!\n"));
@@ -593,15 +616,17 @@ arp_send(unsigned long paddr, struct device *dev, unsigned long saddr)
   skb->dev = dev;
   skb->next = NULL;
   skb->free = 1;
-  tmp = dev->hard_header((unsigned char *)(skb+1), dev,
-			  ETH_P_ARP, 0, saddr, skb->len);
+  tmp = dev->hard_header(skb->data, dev, ETH_P_ARP, 0, saddr, skb->len);
   if (tmp < 0) {
 	kfree_skb(skb,FREE_WRITE);
 	return;
   }
-  arp = (struct arphdr *) ((unsigned char *) (skb+1) + tmp);
+  arp = (struct arphdr *) (skb->data + tmp);
   arp->ar_hrd = htons(dev->type);
-  arp->ar_pro = htons(ETH_P_IP);
+  if(dev->type!=3)	/* AX.25 */
+  	arp->ar_pro = htons(ETH_P_IP);
+  else
+  	arp->ar_pro = htons(0xCC);
   arp->ar_hln = dev->addr_len;
   arp->ar_pln = 4;
   arp->ar_op = htons(ARPOP_REQUEST);
@@ -649,8 +674,8 @@ arp_find(unsigned char *haddr, unsigned long paddr, struct device *dev,
 	 * just pretend we did not find it, and then arp_send will
 	 * verify the address for us.
 	 */
-        if ((!(apt->flags & ATF_PERM)) ||
-	    (!before(apt->last_used, jiffies+ARP_TIMEOUT) && apt->hlen != 0)) {
+        if ((apt->flags & ATF_PERM) ||
+	    (apt->last_used < jiffies+ARP_TIMEOUT && apt->hlen != 0)) {
 		apt->last_used = jiffies;
 		memcpy(haddr, apt->ha, dev->addr_len);
 		return(0);
@@ -773,6 +798,7 @@ arp_get_info(char *buffer)
 				req->arp_ha.sa_family = apt->htype;
 			memcpy((char *) req->arp_ha.sa_data,
 		       		(char *) &apt->ha, apt->hlen);
+			req->arp_flags = apt->flags;
 		}
 		pos += sizeof(struct arpreq);
 		cli();
@@ -809,6 +835,11 @@ arp_req_set(struct arpreq *req)
 		htype = ARPHRD_ETHER;
 		hlen = ETH_ALEN;
 		break;
+		case ARPHRD_AX25:
+			htype = ARPHRD_AX25;
+			hlen = 7;
+			break;
+		
 	default:
 		return(-EPFNOSUPPORT);
   }

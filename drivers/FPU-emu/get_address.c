@@ -3,7 +3,7 @@
  |                                                                           |
  | Get the effective address from an FPU instruction.                        |
  |                                                                           |
- | Copyright (C) 1992,1993                                                   |
+ | Copyright (C) 1992,1993,1994                                              |
  |                       W. Metzenthen, 22 Parker St, Ormond, Vic 3163,      |
  |                       Australia.  E-mail   billm@vaxc.cc.monash.edu.au    |
  |                                                                           |
@@ -46,9 +46,10 @@ static void *sib(int mod)
   unsigned char ss,index,base;
   long offset;
 
-  RE_ENTRANT_CHECK_OFF
+  RE_ENTRANT_CHECK_OFF;
+  FPU_code_verify_area(1);
   base = get_fs_byte((char *) FPU_EIP);   /* The SIB byte */
-  RE_ENTRANT_CHECK_ON
+  RE_ENTRANT_CHECK_ON;
   FPU_EIP++;
   ss = base >> 6;
   index = (base >> 3) & 7;
@@ -74,17 +75,19 @@ static void *sib(int mod)
   if (mod == 1)
     {
       /* 8 bit signed displacement */
-      RE_ENTRANT_CHECK_OFF
+      RE_ENTRANT_CHECK_OFF;
+      FPU_code_verify_area(1);
       offset += (signed char) get_fs_byte((char *) FPU_EIP);
-      RE_ENTRANT_CHECK_ON
+      RE_ENTRANT_CHECK_ON;
       FPU_EIP++;
     }
   else if (mod == 2 || base == 5) /* The second condition also has mod==0 */
     {
       /* 32 bit displacment */
-      RE_ENTRANT_CHECK_OFF
+      RE_ENTRANT_CHECK_OFF;
+      FPU_code_verify_area(4);
       offset += (signed) get_fs_long((unsigned long *) FPU_EIP);
-      RE_ENTRANT_CHECK_ON
+      RE_ENTRANT_CHECK_ON;
       FPU_EIP += 4;
     }
 
@@ -109,7 +112,7 @@ static void *sib(int mod)
 
 */
 
-void get_address(unsigned char FPU_modrm)
+void get_address(unsigned char FPU_modrm, overrides override)
 {
   unsigned char mod;
   long *cpu_reg_ptr;
@@ -134,11 +137,21 @@ void get_address(unsigned char FPU_modrm)
     case 0:
       if (FPU_rm == 5)
 	{
-	  /* Special case: disp32 */
-	  RE_ENTRANT_CHECK_OFF
-	  offset = get_fs_long((unsigned long *) FPU_EIP);
-	  RE_ENTRANT_CHECK_ON
-	  FPU_EIP += 4;
+	  /* Special case: disp16 or disp32 */
+	  RE_ENTRANT_CHECK_OFF;
+	  if ( override.address_size == ADDR_SIZE_PREFIX )
+	    {
+	      FPU_code_verify_area(2);
+	      offset = get_fs_word((unsigned short *) FPU_EIP);
+	      FPU_EIP += 2;
+	    }
+	  else
+	    {
+	      FPU_code_verify_area(4);
+	      offset = get_fs_long((unsigned long *) FPU_EIP);
+	      FPU_EIP += 4;
+	    }
+	  RE_ENTRANT_CHECK_ON;
 	  FPU_data_address = (void *) offset;
 	  return;
 	}
@@ -150,17 +163,28 @@ void get_address(unsigned char FPU_modrm)
 	}
     case 1:
       /* 8 bit signed displacement */
-      RE_ENTRANT_CHECK_OFF
+      RE_ENTRANT_CHECK_OFF;
+      FPU_code_verify_area(1);
       offset = (signed char) get_fs_byte((char *) FPU_EIP);
-      RE_ENTRANT_CHECK_ON
+      RE_ENTRANT_CHECK_ON;
       FPU_EIP++;
       break;
     case 2:
-      /* 32 bit displacement */
-      RE_ENTRANT_CHECK_OFF
-      offset = (signed) get_fs_long((unsigned long *) FPU_EIP);
-      RE_ENTRANT_CHECK_ON
-      FPU_EIP += 4;
+      /* 16 or 32 bit displacement */
+      RE_ENTRANT_CHECK_OFF;
+      if ( override.address_size == ADDR_SIZE_PREFIX )
+	{
+	  FPU_code_verify_area(2);
+	  offset = (signed) get_fs_word((unsigned short *) FPU_EIP);
+	  FPU_EIP += 2;
+	}
+      else
+	{
+	  FPU_code_verify_area(4);
+	  offset = (signed) get_fs_long((unsigned long *) FPU_EIP);
+	  FPU_EIP += 4;
+	}
+      RE_ENTRANT_CHECK_ON;
       break;
     case 3:
       /* Not legal for the FPU */
@@ -168,4 +192,6 @@ void get_address(unsigned char FPU_modrm)
     }
 
   FPU_data_address = offset + (char *)*cpu_reg_ptr;
+  if ( override.address_size == ADDR_SIZE_PREFIX )
+    FPU_data_address = (void *)((long)FPU_data_address & 0xffff);
 }

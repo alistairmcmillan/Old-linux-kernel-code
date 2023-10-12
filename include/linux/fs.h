@@ -12,6 +12,7 @@
 #include <linux/types.h>
 #include <linux/dirent.h>
 #include <linux/vfs.h>
+#include <linux/net.h>
 
 /*
  * It's silly to have NR_OPEN bigger than NR_FILE, but I'll fix
@@ -48,6 +49,7 @@ extern unsigned long file_table_init(unsigned long start, unsigned long end);
 
 #define MAJOR(a) (int)((unsigned short)(a) >> 8)
 #define MINOR(a) (int)((unsigned short)(a) & 0xFF)
+#define MKDEV(a,b) ((int)((((a) & 0xff) << 8) | ((b) & 0xff)))
 
 #ifndef NULL
 #define NULL ((void *) 0)
@@ -153,6 +155,7 @@ struct buffer_head {
 #include <linux/iso_fs_i.h>
 #include <linux/nfs_fs_i.h>
 #include <linux/xia_fs_i.h>
+#include <linux/sysv_fs_i.h>
 
 struct inode {
 	dev_t		i_dev;
@@ -177,6 +180,7 @@ struct inode {
 	struct inode * i_hash_next, * i_hash_prev;
 	struct inode * i_bound_to, * i_bound_by;
 	struct inode * i_mount;
+	struct socket * i_socket;
 	unsigned short i_count;
 	unsigned short i_flags;
 	unsigned char i_lock;
@@ -194,6 +198,7 @@ struct inode {
 		struct iso_inode_info isofs_i;
 		struct nfs_inode_info nfs_i;
 		struct xiafs_inode_info xiafs_i;
+		struct sysv_inode_info sysv_i;
 	} u;
 };
 
@@ -228,6 +233,7 @@ struct file_lock {
 #include <linux/iso_fs_sb.h>
 #include <linux/nfs_fs_sb.h>
 #include <linux/xia_fs_sb.h>
+#include <linux/sysv_fs_sb.h>
 
 struct super_block {
 	dev_t s_dev;
@@ -252,6 +258,7 @@ struct super_block {
 		struct isofs_sb_info isofs_sb;
 		struct nfs_sb_info nfs_sb;
 		struct xiafs_sb_info xiafs_sb;
+		struct sysv_sb_info sysv_sb;
 	} u;
 };
 
@@ -294,7 +301,7 @@ struct super_operations {
 	void (*put_super) (struct super_block *);
 	void (*write_super) (struct super_block *);
 	void (*statfs) (struct super_block *, struct statfs *);
-	int (*remount_fs) (struct super_block *, int *);
+	int (*remount_fs) (struct super_block *, int *, char *);
 };
 
 struct file_system_type {
@@ -317,6 +324,7 @@ extern struct file_operations def_blk_fops;
 extern struct inode_operations blkdev_inode_operations;
 
 extern int register_chrdev(unsigned int, const char *, struct file_operations *);
+extern int unregister_chrdev( unsigned int major, const char * name);
 extern int chrdev_open(struct inode * inode, struct file * filp);
 extern struct file_operations def_chr_fops;
 extern struct inode_operations chrdev_inode_operations;

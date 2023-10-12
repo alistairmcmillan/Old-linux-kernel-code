@@ -36,6 +36,12 @@
 
 #include "skbuff.h"		/* struct sk_buff */
 #include "protocol.h"		/* struct inet_protocol */
+#ifdef CONFIG_AX25
+#include "ax25.h"
+#endif
+#ifdef CONFIG_IPX
+#include "ipx.h"
+#endif
 
 #define SOCK_ARRAY_SIZE	64
 
@@ -73,9 +79,9 @@ struct sock {
 				destroy,
 				ack_timed,
 				no_check,
-				exp_growth,
-				zapped,	/* In ipx means not linked */
-				broadcast;
+				zapped,	/* In ax25 & ipx means not linked */
+				broadcast,
+				nonagle;
   unsigned long		        lingertime;
   int				proc;
   struct sock			*next;
@@ -83,7 +89,8 @@ struct sock {
   struct sk_buff		*volatile send_tail;
   struct sk_buff		*volatile send_head;
   struct sk_buff		*volatile back_log;
-  struct sk_buff		*send_tmp;
+  struct sk_buff		*partial;
+  struct timer_list		partial_timer;
   long				retransmits;
   struct sk_buff		*volatile wback,
 				*volatile wfront,
@@ -95,15 +102,24 @@ struct sock {
   unsigned short		max_unacked;
   unsigned short		window;
   unsigned short		bytes_rcv;
-  unsigned short		mtu;
+/* mss is min(mtu, max_window) */
+  unsigned short		mtu;       /* mss negotiated in the syn's */
+  volatile unsigned short	mss;       /* current eff. mss - can change */
+  volatile unsigned short	user_mss;  /* mss requested by user in ioctl */
+  volatile unsigned short	max_window;
   unsigned short		num;
   volatile unsigned short	cong_window;
+  volatile unsigned short	cong_count;
+  volatile unsigned short	ssthresh;
   volatile unsigned short	packets_out;
   volatile unsigned short	urg;
   volatile unsigned short	shutdown;
-  unsigned short		mss;
   volatile unsigned long	rtt;
   volatile unsigned long	mdev;
+  volatile unsigned long	rto;
+/* currently backoff isn't used, but I'm maintaining it in case
+ * we want to go back to a backoff formula that needs it
+ */
   volatile unsigned short	backoff;
   volatile short		err;
   unsigned char			protocol;
@@ -114,7 +130,27 @@ struct sock {
   unsigned char			debug;
   unsigned short		rcvbuf;
   unsigned short		sndbuf;
-  unsigned short		type;	/* IPX type field */
+  unsigned short		type;
+#ifdef CONFIG_IPX
+  ipx_address			ipx_source_addr,ipx_dest_addr;
+  unsigned short		ipx_type;
+#endif
+#ifdef CONFIG_AX25
+/* Really we want to add a per protocol private area */
+  ax25_address			ax25_source_addr,ax25_dest_addr;
+  struct sk_buff *volatile	ax25_retxq[8];
+  char				ax25_state,ax25_vs,ax25_vr,ax25_lastrxnr,ax25_lasttxnr;
+  char				ax25_condition;
+  char				ax25_retxcnt;
+  char				ax25_xx;
+  char				ax25_retxqi;
+  char				ax25_rrtimer;
+  char				ax25_timer;
+  ax25_digi			*ax25_digipeat;
+#endif  
+/* IP 'private area' or will be eventually */
+  int				ip_ttl;		/* TTL setting */
+  int				ip_tos;		/* TOS */
   struct tcphdr			dummy_th;
 
   /* This part is used for the timeout functions (timer.c). */
@@ -123,13 +159,20 @@ struct sock {
 
   /* identd */
   struct socket			*socket;
+  
+  /* Callbacks */
+  void				(*state_change)(struct sock *sk);
+  void				(*data_ready)(struct sock *sk,int bytes);
+  void				(*write_space)(struct sock *sk);
+  void				(*error_report)(struct sock *sk);
+  
 };
 
 struct proto {
-  void			*(*wmalloc)(struct sock *sk,
+  struct sk_buff *	(*wmalloc)(struct sock *sk,
 				    unsigned long size, int force,
 				    int priority);
-  void			*(*rmalloc)(struct sock *sk,
+  struct sk_buff *	(*rmalloc)(struct sock *sk,
 				    unsigned long size, int force,
 				    int priority);
   void			(*wfree)(struct sock *sk, void *mem,
@@ -155,10 +198,10 @@ struct proto {
 					unsigned long saddr,
 					unsigned long daddr,
 					struct device **dev, int type,
-					struct options *opt, int len);
+					struct options *opt, int len, int tos, int ttl);
   int			(*connect)(struct sock *sk,
 				  struct sockaddr_in *usin, int addr_len);
-  struct sock		*(*accept) (struct sock *sk, int flags);
+  struct sock *		(*accept) (struct sock *sk, int flags);
   void			(*queue_xmit)(struct sock *sk,
 				      struct device *dev, struct sk_buff *skb,
 				      int free);
@@ -175,9 +218,13 @@ struct proto {
 				 unsigned long arg);
   int			(*init)(struct sock *sk);
   void			(*shutdown)(struct sock *sk, int how);
+  int			(*setsockopt)(struct sock *sk, int level, int optname,
+  				 char *optval, int optlen);
+  int			(*getsockopt)(struct sock *sk, int level, int optname,
+  				char *optval, int *option);  	 
   unsigned short	max_header;
   unsigned long		retransmits;
-  struct sock		*sock_array[SOCK_ARRAY_SIZE];
+  struct sock *		sock_array[SOCK_ARRAY_SIZE];
   char			name[80];
 };
 
@@ -186,6 +233,7 @@ struct proto {
 #define TIME_KEEPOPEN	3
 #define TIME_DESTROY	4
 #define TIME_DONE	5	/* used to absorb those last few packets */
+#define TIME_PROBE0	6
 #define SOCK_DESTROY_TIME 1000	/* about 10 seconds			*/
 
 #define PROT_SOCK	1024	/* Sockets 0-1023 can't be bound too unless you are superuser */
@@ -203,10 +251,10 @@ extern struct sock		*get_sock(struct proto *, unsigned short,
 					  unsigned long, unsigned short,
 					  unsigned long);
 extern void			print_sk(struct sock *);
-extern void			*sock_wmalloc(struct sock *sk,
+extern struct sk_buff		*sock_wmalloc(struct sock *sk,
 					      unsigned long size, int force,
 					      int priority);
-extern void			*sock_rmalloc(struct sock *sk,
+extern struct sk_buff		*sock_rmalloc(struct sock *sk,
 					      unsigned long size, int force,
 					      int priority);
 extern void			sock_wfree(struct sock *sk, void *mem,
@@ -216,6 +264,8 @@ extern void			sock_rfree(struct sock *sk, void *mem,
 extern unsigned long		sock_rspace(struct sock *sk);
 extern unsigned long		sock_wspace(struct sock *sk);
 
+extern int			sock_setsockopt(struct sock *sk,int level,int op,char *optval,int optlen);
+extern int			sock_getsockopt(struct sock *sk,int level,int op,char *optval,int *optlen);
 
 /* declarations from timer.c */
 extern struct sock *timer_base;

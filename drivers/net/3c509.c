@@ -33,16 +33,6 @@ static char *version = "3c509.c:pl13t 11/24/93 becker@super.org\n";
 #include "skbuff.h"
 #include "arp.h"
 
-#ifndef port_read
-#include "iow.h"
-#endif
-
-/* These should be in <asm/io.h>. */
-#define port_read_l(port,buf,nr) \
-__asm__("cld;rep;insl": :"d" (port),"D" (buf),"c" (nr):"cx","di")
-#define port_write_l(port,buf,nr) \
-__asm__("cld;rep;outsl": :"d" (port),"S" (buf),"c" (nr):"cx","si")
-
 #ifndef HAVE_ALLOC_SKB
 #define alloc_skb(size, priority) (struct sk_buff *) kmalloc(size,priority)
 #endif
@@ -102,9 +92,8 @@ int el3_probe(struct device *dev)
 	short *phys_addr = (short *)dev->dev_addr;
 	static int current_tag = 0;
 
-	/* First check for a board on the EISA bus.	 This first check should
-	   really be in init/main.c, along with a MCA check. */
-	if (strncmp((char*)0x0FFFD9, "EISA", 4) == 0) {
+	/* First check for a board on the EISA bus. */
+	if (EISA_bus) {
 		for (ioaddr = 0x1000; ioaddr < 0x9000; ioaddr += 0x1000) {
 			if (inw(ioaddr) != 0x6d50)
 				continue;
@@ -377,7 +366,7 @@ el3_start_xmit(struct sk_buff *skb, struct device *dev)
 	}
 
 	/* Fill in the ethernet header. */
-	if (!skb->arp  &&  dev->rebuild_header(skb+1, dev)) {
+	if (!skb->arp  &&  dev->rebuild_header(skb->data, dev)) {
 		skb->dev = dev;
 		arp_queue (skb);
 		return 0;
@@ -415,7 +404,7 @@ el3_start_xmit(struct sk_buff *skb, struct device *dev)
 		outw(skb->len, ioaddr + TX_FIFO);
 		outw(0x00, ioaddr + TX_FIFO);
 		/* ... and the packet rounded to a doubleword. */
-		port_write_l(ioaddr + TX_FIFO, (void *)(skb+1), (skb->len + 3) >> 2);
+		outsl(ioaddr + TX_FIFO, skb->data, (skb->len + 3) >> 2);
 	
 		dev->trans_start = jiffies;
 		if (inw(ioaddr + TX_FREE) > 1536) {
@@ -587,8 +576,8 @@ el3_rx(struct device *dev)
 				skb->len = pkt_len;
 				skb->dev = dev;
 
-				/* 'skb+1' points to the start of sk_buff data area. */
-				port_read_l(ioaddr+RX_FIFO, (void *)(skb+1),
+				/* 'skb->data' points to the start of sk_buff data area. */
+				insl(ioaddr+RX_FIFO, skb->data,
 							(pkt_len + 3) >> 2);
 
 #ifdef HAVE_NETIF_RX

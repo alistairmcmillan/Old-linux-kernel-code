@@ -13,6 +13,8 @@
  *
  * Fixes:	
  *		Alan Cox	:	Generic queue usage.
+ *		Gerhard Koerting:	ICMP addressing corrected
+ *		Alan Cox	:	Use tos/ttl settings
  *
  *
  *		This program is free software; you can redistribute it and/or
@@ -102,12 +104,11 @@ icmp_send(struct sk_buff *skb_in, int type, int code, struct device *dev)
   len -= sizeof(struct sk_buff);
 
   /* Find the IP header. */
-  iph = (struct iphdr *) (skb_in + 1);
-  iph = (struct iphdr *) ((unsigned char *) iph + dev->hard_header_len);
+  iph = (struct iphdr *) (skb_in->data + dev->hard_header_len);
 
   /* Build Layer 2-3 headers for message back to source. */
-  offset = ip_build_header(skb, iph->daddr, iph->saddr,
-			   &dev, IPPROTO_ICMP, NULL, len);
+  offset = ip_build_header(skb, dev->pa_addr, iph->saddr,
+			   &dev, IPPROTO_ICMP, NULL, len, skb_in->ip_hdr->tos,255);
   if (offset < 0) {
 	skb->sk = NULL;
 	kfree_skb(skb, FREE_READ);
@@ -116,7 +117,7 @@ icmp_send(struct sk_buff *skb_in, int type, int code, struct device *dev)
 
   /* Re-adjust length according to actual IP header size. */
   skb->len = offset + sizeof(struct icmphdr) + sizeof(struct iphdr) + 8;
-  icmph = (struct icmphdr *) ((unsigned char *) (skb + 1) + offset);
+  icmph = (struct icmphdr *) (skb->data + offset);
   icmph->type = type;
   icmph->code = code;
   icmph->checksum = 0;
@@ -209,12 +210,12 @@ icmp_redirect(struct icmphdr *icmph, struct sk_buff *skb, struct device *dev)
   ip = iph->daddr;
   switch(icmph->code & 7) {
 	case ICMP_REDIR_NET:
-		rt_add((RTF_DYNAMIC | RTF_MODIFIED),
-			ip, icmph->un.gateway, dev);
+		rt_add((RTF_DYNAMIC | RTF_MODIFIED | RTF_GATEWAY),
+			ip, 0, icmph->un.gateway, dev);
 		break;
 	case ICMP_REDIR_HOST:
-		rt_add((RTF_DYNAMIC | RTF_MODIFIED | RTF_HOST),
-			ip, icmph->un.gateway, dev);
+		rt_add((RTF_DYNAMIC | RTF_MODIFIED | RTF_HOST | RTF_GATEWAY),
+			ip, 0, icmph->un.gateway, dev);
 		break;
 	case ICMP_REDIR_NETTOS:
 	case ICMP_REDIR_HOSTTOS:
@@ -254,7 +255,7 @@ icmp_echo(struct icmphdr *icmph, struct sk_buff *skb, struct device *dev,
 
   /* Build Layer 2-3 headers for message back to source */
   offset = ip_build_header(skb2, daddr, saddr, &dev,
-			 	IPPROTO_ICMP, opt, len);
+			 	IPPROTO_ICMP, opt, len, skb->ip_hdr->tos,255);
   if (offset < 0) {
 	printk("ICMP: Could not build IP Header for ICMP ECHO Response\n");
 	kfree_skb(skb2,FREE_WRITE);
@@ -267,7 +268,7 @@ icmp_echo(struct icmphdr *icmph, struct sk_buff *skb, struct device *dev,
   skb2->len = offset + len;
 
   /* Build ICMP_ECHO Response message. */
-  icmphr = (struct icmphdr *) ((char *) (skb2 + 1) + offset);
+  icmphr = (struct icmphdr *) (skb2->data + offset);
   memcpy((char *) icmphr, (char *) icmph, len);
   icmphr->type = ICMP_ECHOREPLY;
   icmphr->code = 0;
@@ -318,7 +319,7 @@ icmp_address(struct icmphdr *icmph, struct sk_buff *skb, struct device *dev,
 
   /* Build Layer 2-3 headers for message back to source */
   offset = ip_build_header(skb2, daddr, saddr, &dev,
-			 	IPPROTO_ICMP, opt, len);
+			 	IPPROTO_ICMP, opt, len, skb->ip_hdr->tos,255);
   if (offset < 0) {
 	printk("ICMP: Could not build IP Header for ICMP ADDRESS Response\n");
 	kfree_skb(skb2,FREE_WRITE);
@@ -331,7 +332,7 @@ icmp_address(struct icmphdr *icmph, struct sk_buff *skb, struct device *dev,
   skb2->len = offset + len;
 
   /* Build ICMP ADDRESS MASK Response message. */
-  icmphr = (struct icmphdr *) ((char *) (skb2 + 1) + offset);
+  icmphr = (struct icmphdr *) (skb2->data + offset);
   icmphr->type = ICMP_ADDRESSREPLY;
   icmphr->code = 0;
   icmphr->checksum = 0;

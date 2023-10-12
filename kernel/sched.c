@@ -16,6 +16,7 @@
 #include <linux/sched.h>
 #include <linux/timer.h>
 #include <linux/kernel.h>
+#include <linux/kernel_stat.h>
 #include <linux/sys.h>
 #include <linux/fdreg.h>
 #include <linux/errno.h>
@@ -56,6 +57,7 @@ long time_adj = 0;              /* tick adjust (scaled 1 / HZ) */
 long time_reftime = 0;          /* time at last adjustment (s) */
 
 long time_adjust = 0;
+long time_adjust_step = 0;
 
 int need_resched = 0;
 
@@ -66,6 +68,11 @@ int hard_math = 0;		/* set by boot/head.S */
 int x86 = 0;			/* set by boot/head.S to 3 or 4 */
 int ignore_irq13 = 0;		/* set if exception 16 works */
 int wp_works_ok = 0;		/* set if paging hardware honours WP */ 
+
+/*
+ * Bus types ..
+ */
+int EISA_bus = 0;
 
 extern int _setitimer(int, struct itimerval *, struct itimerval *);
 unsigned long * prof_buffer = NULL;
@@ -95,6 +102,9 @@ struct {
 	short b;
 	} stack_start = { & user_stack [PAGE_SIZE>>2] , KERNEL_DS };
 
+struct kernel_stat kstat =
+	{ 0, 0, 0, { 0, 0, 0, 0 }, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
 /*
  * int 0x80 entry points.. Moved away from the header file, as
  * iBCS2 may also want to use the '<linux/sys.h>' headers..
@@ -102,6 +112,11 @@ struct {
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+int sys_ni_syscall(void)
+{
+	return -EINVAL;
+}
 
 fn_ptr sys_call_table[] = { sys_setup, sys_exit, sys_fork, sys_read,
 sys_write, sys_open, sys_close, sys_waitpid, sys_creat, sys_link,
@@ -126,7 +141,9 @@ sys_syslog, sys_setitimer, sys_getitimer, sys_newstat, sys_newlstat,
 sys_newfstat, sys_uname, sys_iopl, sys_vhangup, sys_idle, sys_vm86,
 sys_wait4, sys_swapoff, sys_sysinfo, sys_ipc, sys_fsync, sys_sigreturn,
 sys_clone, sys_setdomainname, sys_newuname, sys_modify_ldt,
-sys_adjtimex, sys_mprotect, sys_sigprocmask };
+sys_adjtimex, sys_mprotect, sys_sigprocmask, sys_create_module,
+sys_init_module, sys_delete_module, sys_get_kernel_syms, sys_quotactl,
+sys_getpgid, sys_fchdir, sys_bdflush };
 
 /* So we don't have to do any more manual updating.... */
 int NR_syscalls = sizeof(sys_call_table)/sizeof(fn_ptr);
@@ -175,6 +192,10 @@ asmlinkage void math_emulate(long arg)
 
 #endif /* CONFIG_MATH_EMULATION */
 
+static unsigned long itimer_ticks = 0;
+static unsigned long itimer_next = ~0;
+static unsigned long lost_ticks = 0;
+
 /*
  *  'schedule()' is the scheduler function. It's a very simple and nice
  * scheduler: it's not perfect, but certainly works for most things.
@@ -192,15 +213,36 @@ asmlinkage void schedule(void)
 	int c;
 	struct task_struct * p;
 	struct task_struct * next;
+	unsigned long ticks;
 
 /* check alarm, wake up any interruptible tasks that have got a signal */
 
+	cli();
+	ticks = itimer_ticks;
+	itimer_ticks = 0;
+	itimer_next = ~0;
 	sti();
 	need_resched = 0;
 	p = &init_task;
 	for (;;) {
 		if ((p = p->next_task) == &init_task)
 			goto confuse_gcc1;
+		if (ticks && p->it_real_value) {
+			if (p->it_real_value <= ticks) {
+				send_sig(SIGALRM, p, 1);
+				if (!p->it_real_incr) {
+					p->it_real_value = 0;
+					goto end_itimer;
+				}
+				do {
+					p->it_real_value += p->it_real_incr;
+				} while (p->it_real_value <= ticks);
+			}
+			p->it_real_value -= ticks;
+			if (p->it_real_value < itimer_next)
+				itimer_next = p->it_real_value;
+		}
+end_itimer:
 		if (p->state != TASK_INTERRUPTIBLE)
 			continue;
 		if (p->signal & ~p->blocked) {
@@ -238,6 +280,8 @@ confuse_gcc2:
 		for_each_task(p)
 			p->counter = (p->counter >> 1) + p->priority;
 	}
+	if(current != next)
+		kstat.context_swtch++;
 	switch_to(next);
 	/* Now maybe reload the debug registers */
 	if(current->debugreg[7]){
@@ -503,13 +547,14 @@ static void second_overflow(void)
 	    last_rtc_update = xtime.tv_sec;
 }
 
-static int lost_ticks = 0;
-
 /*
  * disregard lost ticks for now.. We don't care enough.
  */
 static void timer_bh(void * unused)
 {
+	unsigned long mask;
+	struct timer_struct *tp;
+
 	cli();
 	while (next_timer && next_timer->expires == 0) {
 		void (*fn)(unsigned long) = next_timer->function;
@@ -520,6 +565,18 @@ static void timer_bh(void * unused)
 		cli();
 	}
 	sti();
+	
+	for (mask = 1, tp = timer_table+0 ; mask ; tp++,mask += mask) {
+		if (mask > timer_active)
+			break;
+		if (!(mask & timer_active))
+			continue;
+		if (tp->expires > jiffies)
+			continue;
+		timer_active &= ~mask;
+		tp->fn();
+		sti();
+	}
 }
 
 /*
@@ -531,8 +588,7 @@ static void timer_bh(void * unused)
 static void do_timer(struct pt_regs * regs)
 {
 	unsigned long mask;
-	struct timer_struct *tp = timer_table+0;
-	struct task_struct * task_p;
+	struct timer_struct *tp;
 
 	long ltemp;
 
@@ -543,41 +599,38 @@ static void do_timer(struct pt_regs * regs)
 	if (time_phase < -FINEUSEC) {
 		ltemp = -time_phase >> SHIFT_SCALE;
 		time_phase += ltemp << SHIFT_SCALE;
-		xtime.tv_usec += tick - ltemp;
+		xtime.tv_usec += tick + time_adjust_step - ltemp;
 	}
 	else if (time_phase > FINEUSEC) {
 		ltemp = time_phase >> SHIFT_SCALE;
 		time_phase -= ltemp << SHIFT_SCALE;
-		xtime.tv_usec += tick + ltemp;
+		xtime.tv_usec += tick + time_adjust_step + ltemp;
 	} else
-		xtime.tv_usec += tick;
+		xtime.tv_usec += tick + time_adjust_step;
 
 	if (time_adjust)
 	{
 	    /* We are doing an adjtime thing. 
-	     */
-
-	    /* Limit the amount of the step for *next* tick to be
+	     *
+	     * Modify the value of the tick for next time.
+	     * Note that a positive delta means we want the clock
+	     * to run fast. This means that the tick should be bigger
+	     *
+	     * Limit the amount of the step for *next* tick to be
 	     * in the range -tickadj .. +tickadj
 	     */
 	     if (time_adjust > tickadj)
-	       ltemp = tickadj;
+	       time_adjust_step = tickadj;
 	     else if (time_adjust < -tickadj)
-	       ltemp = -tickadj;
+	       time_adjust_step = -tickadj;
 	     else
-	       ltemp = time_adjust;
+	       time_adjust_step = time_adjust;
 	     
-	    /* Reduce the amount of time left by this step */
-	    time_adjust -= ltemp;
-
-	    /* Modify the value of the tick for next time.
-	     * Note that a positive delta means we want the clock
-	     * to run fast. This means that the tick should be bigger
-	     */
-	    tick = 1000000/HZ + ltemp;
+	    /* Reduce by this step the amount of time left  */
+	    time_adjust -= time_adjust_step;
 	}
 	else
-	    tick = 1000000/HZ;
+	    time_adjust_step = 0;
 
 	if (xtime.tv_usec >= 1000000) {
 	    xtime.tv_usec -= 1000000;
@@ -589,6 +642,12 @@ static void do_timer(struct pt_regs * regs)
 	calc_load();
 	if ((VM_MASK & regs->eflags) || (3 & regs->cs)) {
 		current->utime++;
+		if (current != task[0]) {
+			if (current->priority < 15)
+				kstat.cpu_nice++;
+			else
+				kstat.cpu_user++;
+		}
 		/* Update ITIMER_VIRT for current task if not in a system call */
 		if (current->it_virt_value && !(--current->it_virt_value)) {
 			current->it_virt_value = current->it_virt_incr;
@@ -596,6 +655,8 @@ static void do_timer(struct pt_regs * regs)
 		}
 	} else {
 		current->stime++;
+		if(current != task[0])
+			kstat.cpu_system++;
 #ifdef CONFIG_PROFILE
 		if (prof_buffer && current != task[0]) {
 			unsigned long eip = regs->eip;
@@ -609,33 +670,24 @@ static void do_timer(struct pt_regs * regs)
 		current->counter=0;
 		need_resched = 1;
 	}
-	/* Update ITIMER_REAL for every task */
-	for_each_task(task_p) {
-		if (!task_p->it_real_value)
-			continue;
-		if (--task_p->it_real_value)
-			continue;
-		send_sig(SIGALRM,task_p,1);
-		task_p->it_real_value = task_p->it_real_incr;
-		need_resched = 1;
-	}
 	/* Update ITIMER_PROF for the current task */
 	if (current->it_prof_value && !(--current->it_prof_value)) {
 		current->it_prof_value = current->it_prof_incr;
 		send_sig(SIGPROF,current,1);
 	}
-	for (mask = 1 ; mask ; tp++,mask += mask) {
+	for (mask = 1, tp = timer_table+0 ; mask ; tp++,mask += mask) {
 		if (mask > timer_active)
 			break;
 		if (!(mask & timer_active))
 			continue;
 		if (tp->expires > jiffies)
 			continue;
-		timer_active &= ~mask;
-		tp->fn();
-		sti();
+		mark_bh(TIMER_BH);
 	}
 	cli();
+	itimer_ticks++;
+	if (itimer_ticks > itimer_next)
+		need_resched = 1;
 	if (next_timer) {
 		if (next_timer->expires) {
 			next_timer->expires--;
@@ -714,8 +766,10 @@ static void show_task(int nr,struct task_struct * p)
 		printk(stat_nam[p->state]);
 	else
 		printk(" ");
-	/* this prints bogus values for the current process */
-	printk(" %08lX ", ((unsigned long *)p->tss.esp)[2]);
+	if (p == current)
+		printk(" current  ");
+	else
+		printk(" %08lX ", ((unsigned long *)p->tss.esp)[3]);
 	printk("%5lu %5d %6d ",
 		p->tss.esp - p->kernel_stack_page, p->pid, p->p_pptr->pid);
 	if (p->p_cptr)

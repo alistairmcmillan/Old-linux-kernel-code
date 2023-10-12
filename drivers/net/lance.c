@@ -14,7 +14,7 @@
     C/O Supercomputing Research Ctr., 17100 Science Dr., Bowie MD 20715
 */
 
-static char *version = "lance.c:v0.13s 11/15/93 becker@super.org\n";
+static char *version = "lance.c:v0.14g 12/21/93 becker@super.org\n";
 
 #include <linux/config.h>
 #include <linux/kernel.h>
@@ -30,7 +30,6 @@ static char *version = "lance.c:v0.13s 11/15/93 becker@super.org\n";
 #include <asm/dma.h>
 
 #include "dev.h"
-#include "iow.h"
 #include "eth.h"
 #include "skbuff.h"
 #include "arp.h"
@@ -145,7 +144,7 @@ tx_full and tbusy flags.
    Reasonable default values are 4 Tx buffers, and 16 Rx buffers.
    That translates to 2 (4 == 2^^2) and 4 (16 == 2^^4). */
 #ifndef LANCE_LOG_TX_BUFFERS
-#define LANCE_LOG_TX_BUFFERS 2
+#define LANCE_LOG_TX_BUFFERS 4
 #define LANCE_LOG_RX_BUFFERS 4
 #endif
 
@@ -224,7 +223,6 @@ unsigned long lance_init(unsigned long mem_start, unsigned long mem_end)
 {
     int *port, ports[] = {0x300, 0x320, 0x340, 0x360, 0};
 
-    printk("lance_init(%#x, %#x).\n", mem_start, mem_end);
     for (port = &ports[0]; *port; port++) {
 	int ioaddr = *port;
 
@@ -336,7 +334,8 @@ static unsigned long lance_probe1(short ioaddr, unsigned long mem_start)
 
 	    dev->irq = autoirq_report(1);
 	    if (dev->irq)
-		printk(", probed IRQ %d, fixed at DMA %d.\n", dev->irq, dev->dma);
+		printk(", probed IRQ %d, fixed at DMA %d.\n",
+		       dev->irq, dev->dma);
 	    else {
 		printk(", failed to detect IRQ line.\n");
 		return mem_start;
@@ -513,7 +512,7 @@ lance_start_xmit(struct sk_buff *skb, struct device *dev)
     }
 
     /* Fill in the ethernet header. */
-    if (!skb->arp  &&  dev->rebuild_header(skb+1, dev)) {
+    if (!skb->arp  &&  dev->rebuild_header(skb->data, dev)) {
 	skb->dev = dev;
 	arp_queue (skb);
 	return 0;
@@ -554,18 +553,22 @@ lance_start_xmit(struct sk_buff *skb, struct device *dev)
 
     /* If any part of this buffer is >16M we must copy it to a low-memory
        buffer. */
-    if ((int)(skb+1) + skb->len > 0x01000000) {
+    if ((int)(skb->data) + skb->len > 0x01000000) {
 	if (lance_debug > 5)
 	    printk("%s: bouncing a high-memory packet (%#x).\n",
-		   dev->name, (int)(skb+1));
-	memcpy(&lp->tx_bounce_buffs[entry], skb+1, skb->len);
+		   dev->name, (int)skb->data);
+	memcpy(&lp->tx_bounce_buffs[entry], skb->data, skb->len);
 	lp->tx_ring[entry].base =
 	    (int)(lp->tx_bounce_buffs + entry) | 0x83000000;
 	if (skb->free)
 	    kfree_skb (skb, FREE_WRITE);
     } else
-	lp->tx_ring[entry].base = (int)(skb+1) | 0x83000000;
-
+    {
+    	/* Gimme!!! */
+    	if(skb->free==0)
+    		skb_kept_by_device(skb);
+	lp->tx_ring[entry].base = (int)skb->data | 0x83000000;
+    }
     lp->cur_tx++;
 
     /* Trigger an immediate send poll. */
@@ -617,13 +620,6 @@ lance_interrupt(int reg_ptr)
     if (csr0 & 0x0200) {	/* Tx-done interrupt */
 	int dirty_tx = lp->dirty_tx;
 
-	if (dirty_tx == lp->cur_tx - TX_RING_SIZE
-	    && dev->tbusy) {
-	    /* The ring is full, clear tbusy. */
-	    dev->tbusy = 0;
-	    mark_bh(INET_BH);
-	}
-
 	while (dirty_tx < lp->cur_tx) {
 	    int entry = dirty_tx & TX_RING_MOD_MASK;
 	    int status = lp->tx_ring[entry].base;
@@ -650,25 +646,34 @@ lance_interrupt(int reg_ptr)
 
 	    /* We don't free the skb if it's a data-only copy in the bounce
 	       buffer.  The address checks here are sorted -- the first test
-	       should always works.  */
+	       should always work.  */
 	    if (databuff >= (void*)(&lp->tx_bounce_buffs[TX_RING_SIZE])
 		|| databuff < (void*)(lp->tx_bounce_buffs)) {
 		struct sk_buff *skb = ((struct sk_buff *)databuff) - 1;
 		if (skb->free)
 		    kfree_skb(skb, FREE_WRITE);
+		else
+		    skb_device_release(skb,FREE_WRITE);
+		/* Warning: skb may well vanish at the point you call device_release! */
 	    }
 	    dirty_tx++;
 	}
-
-	lp->dirty_tx = dirty_tx;
 
 #ifndef final_version
 	if (lp->cur_tx - dirty_tx >= TX_RING_SIZE) {
 	    printk("out-of-sync dirty pointer, %d vs. %d.\n",
 		   dirty_tx, lp->cur_tx);
-	    lp->dirty_tx += TX_RING_SIZE;
+	    dirty_tx += TX_RING_SIZE;
 	}
 #endif
+
+	if (dev->tbusy  &&  dirty_tx > lp->cur_tx - TX_RING_SIZE + 2) {
+	    /* The ring is no longer full, clear tbusy. */
+	    dev->tbusy = 0;
+	    mark_bh(INET_BH);
+	}
+
+	lp->dirty_tx = dirty_tx;
     }
 
     if (csr0 & 0x8000) {
@@ -721,7 +726,7 @@ lance_rx(struct device *dev)
 	    skb->mem_addr = skb;
 	    skb->len = pkt_len;
 	    skb->dev = dev;
-	    memcpy((unsigned char *) (skb + 1),
+	    memcpy(skb->data,
 		   (unsigned char *)(lp->rx_ring[entry].base & 0x00ffffff),
 		   pkt_len);
 #ifdef HAVE_NETIF_RX

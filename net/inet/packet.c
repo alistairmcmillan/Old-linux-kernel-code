@@ -18,6 +18,7 @@
  *					added. Also fixed the peek/read crash
  *					from all old Linux datagram code.
  *		Alan Cox	:	Uses the improved datagram code.
+ *		Alan Cox	:	Added NULL's for socket options.
  *
  *
  *		This program is free software; you can redistribute it and/or
@@ -73,7 +74,7 @@ packet_rcv(struct sk_buff *skb, struct device *dev,  struct packet_type *pt)
   }
   sk->rmem_alloc += skb->mem_len;
   skb_queue_tail(&sk->rqueue,skb);
-  wake_up(sk->sleep);
+  wake_up_interruptible(sk->sleep);
   release_sock(sk);
   return(0);
 }
@@ -118,7 +119,7 @@ packet_sendto(struct sock *sk, unsigned char *from, int len,
   	return -EMSGSIZE;
 
 /* Now allocate the buffer, knowing 4K pagelimits wont break this line */  
-  skb = (struct sk_buff *) sk->prot->wmalloc(sk, len+sizeof(*skb), 0, GFP_KERNEL);
+  skb = sk->prot->wmalloc(sk, len+sizeof(*skb), 0, GFP_KERNEL);
 
   /* This shouldn't happen, but it could. */
   if (skb == NULL) {
@@ -130,9 +131,10 @@ packet_sendto(struct sock *sk, unsigned char *from, int len,
   skb->mem_len = len + sizeof(*skb);
   skb->sk = sk;
   skb->free = 1;
-  memcpy_fromfs (skb+1, from, len);
+  memcpy_fromfs(skb->data, from, len);
   skb->len = len;
   skb->next = NULL;
+  skb->arp = 1;
   if (dev->flags & IFF_UP) dev->queue_xmit(skb, dev, sk->priority);
     else kfree_skb(skb, FREE_WRITE);
   return(len);
@@ -213,7 +215,7 @@ packet_recvfrom(struct sock *sk, unsigned char *to, int len,
   	return err;
   copied = min(len, skb->len);
 
-  memcpy_tofs(to, skb+1, copied);	/* Don't use skb_copy_datagram here: We can't get frag chains */
+  memcpy_tofs(to, skb->data, copied);	/* Don't use skb_copy_datagram here: We can't get frag chains */
 
   /* Copy the address. */
   if (saddr) {
@@ -263,6 +265,8 @@ struct proto packet_prot = {
   datagram_select,
   NULL,
   packet_init,
+  NULL,
+  NULL,	/* No set/get socket options */
   NULL,
   128,
   0,

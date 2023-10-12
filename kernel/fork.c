@@ -20,6 +20,7 @@
 #include <linux/segment.h>
 #include <linux/ptrace.h>
 #include <linux/malloc.h>
+#include <linux/ldt.h>
 
 #include <asm/segment.h>
 #include <asm/system.h>
@@ -55,7 +56,8 @@ repeat:
 		}
 		if (task[i]->uid == current->uid)
 			this_user_tasks++;
-		if (task[i]->pid == last_pid || task[i]->pgrp == last_pid)
+		if (task[i]->pid == last_pid || task[i]->pgrp == last_pid ||
+		    task[i]->session == last_pid)
 			goto repeat;
 	}
 	if (tasks_free <= MIN_TASKS_LEFT_FOR_ROOT ||
@@ -182,8 +184,9 @@ asmlinkage int sys_fork(struct pt_regs regs)
 	p->exit_signal = clone_flags & CSIGNAL;
 	p->tss.ldt = _LDT(nr);
 	if (p->ldt) {
-		if ((p->ldt = (struct desc_struct*) __get_free_page(GFP_KERNEL)) != NULL)
-			memcpy(p->ldt, current->ldt, PAGE_SIZE);
+		p->ldt = (struct desc_struct*) vmalloc(LDT_ENTRIES*LDT_ENTRY_SIZE);
+		if (p->ldt != NULL)
+			memcpy(p->ldt, current->ldt, LDT_ENTRIES*LDT_ENTRY_SIZE);
 	}
 	p->tss.bitmap = offsetof(struct tss_struct,io_bitmap);
 	for (i = 0; i < IO_BITMAP_SIZE+1 ; i++) /* IO bitmap is actually SIZE+1 */

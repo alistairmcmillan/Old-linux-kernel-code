@@ -385,7 +385,7 @@ fake_volatile:
 	}
 
 	if (current->ldt) {
-		free_page((unsigned long) current->ldt);
+		vfree(current->ldt);
 		current->ldt = NULL;
 		for (i=1 ; i<NR_TASKS ; i++) {
 			if (task[i] == current) {
@@ -429,7 +429,7 @@ fake_volatile:
 		current->p_cptr = p->p_osptr;
 		p->p_ysptr = NULL;
 		p->flags &= ~(PF_PTRACED|PF_TRACESYS);
-		if (task[1])
+		if (task[1] && task[1] != current)
 			p->p_pptr = task[1];
 		else
 			p->p_pptr = task[0];
@@ -452,24 +452,8 @@ fake_volatile:
 			kill_pg(p->pgrp,SIGCONT,1);
 		}
 	}
-	if (current->leader) {
-		struct task_struct *p;
-		struct tty_struct *tty;
-
-		if (current->tty >= 0) {
-			tty = TTY_TABLE(current->tty);
-			if (tty) {
-				if (tty->pgrp > 0)
-					kill_pg(tty->pgrp, SIGHUP, 1);
-				tty->pgrp = -1;
-				tty->session = 0;
-			}
-		}
-		for_each_task(p) {
-			if (p->session == current->session)
-				p->tty = -1;
-		}
-	}
+	if (current->leader)
+		disassociate_ctty(1);
 	if (last_task_used_math == current)
 		last_task_used_math = NULL;
 #ifdef DEBUG_PROC_TREE

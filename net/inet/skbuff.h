@@ -60,6 +60,7 @@ struct sk_buff {
 	ipx_packet	*ipx;
 #endif	
   } h;
+  struct iphdr		*ip_hdr;		/* For IPPROTO_RAW */
   unsigned long			mem_len;
   unsigned long 		len;
   unsigned long			fraglen;
@@ -75,6 +76,8 @@ struct sk_buff {
 				urg_used;
   unsigned char			tries,lock;	/* Lock is now unused */
   unsigned short		users;		/* User count - see datagram.c (and soon seqpacket.c/stream.c) */
+  unsigned long			padding[0];
+  unsigned char			data[0];
 };
 
 #define SK_WMEM_MAX	8192
@@ -96,7 +99,9 @@ extern struct sk_buff *		skb_peek(struct sk_buff * volatile *list);
 extern struct sk_buff *		skb_peek_copy(struct sk_buff * volatile *list);
 extern struct sk_buff *		alloc_skb(unsigned int size, int priority);
 extern void			kfree_skbmem(void *mem, unsigned size);
-
+extern void			skb_kept_by_device(struct sk_buff *skb);
+extern void			skb_device_release(struct sk_buff *skb, int mode);
+extern int			skb_device_locked(struct sk_buff *skb);
 extern void 			skb_check(struct sk_buff *skb,int, char *);
 #define IS_SKB(skb)	skb_check((skb),__LINE__,__FILE__)
 

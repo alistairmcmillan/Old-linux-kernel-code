@@ -252,7 +252,8 @@ static void setup_frame(struct sigaction * sa, unsigned long ** fp, unsigned lon
 	if (regs->ss != USER_DS)
 		frame = (unsigned long *) sa->sa_restorer;
 	frame -= 32;
-	verify_area(VERIFY_WRITE,frame,32*4);
+	if (verify_area(VERIFY_WRITE,frame,32*4))
+		do_exit(SIGSEGV);
 /* set up the "normal" stack seen by the signal handler (iBCS2) */
 	put_fs_long(__CODE,frame);
 	put_fs_long(signr, frame+1);
@@ -268,8 +269,8 @@ static void setup_frame(struct sigaction * sa, unsigned long ** fp, unsigned lon
 	put_fs_long(regs->edx, frame+11);
 	put_fs_long(regs->ecx, frame+12);
 	put_fs_long(regs->eax, frame+13);
-	put_fs_long(0, frame+14);		/* trapno - not implemented */
-	put_fs_long(0, frame+15);		/* err - not implemented */
+	put_fs_long(current->tss.trap_no, frame+14);
+	put_fs_long(current->tss.error_code, frame+15);
 	put_fs_long(eip, frame+16);
 	put_fs_long(regs->cs, frame+17);
 	put_fs_long(regs->eflags, frame+18);
@@ -407,6 +408,7 @@ asmlinkage int do_signal(unsigned long oldmask, struct pt_regs * regs)
 		oldmask |= sa->sa_mask;
 	}
 	regs->esp = (unsigned long) frame;
-	regs->eip = eip;			/* "return" to the first handler */
+	regs->eip = eip;		/* "return" to the first handler */
+	current->tss.trap_no = current->tss.error_code = 0;
 	return 1;
 }

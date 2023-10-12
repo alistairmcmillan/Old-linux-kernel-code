@@ -12,11 +12,12 @@
  *
  * Fixes:
  *		Alan Cox	:	Verify Area
+ *		NET2E Team	:	Page fault locks
  *
- * BUGS
- *	Page faults on read while another process reads could lose data.
- *	Page faults on write happen to interleave data (probably not allowed)
- *	with any other simultaneous writers on the socket but dont cause harm.
+ * To Do:
+ *
+ *	Change to the NET2E3 code for Unix domain sockets in general. The
+ *	read/write logic is much better and cleaner.
  *
  *
  *		This program is free software; you can redistribute it and/or
@@ -140,6 +141,29 @@ sockaddr_un_printk(struct sockaddr_un *sockun, int sockaddr_len)
   }
 }
   
+
+/* Support routines doing anti page fault locking 
+ * FvK & Matt Dillon (borrowed From NET2E3)
+ */
+
+/*
+ * Locking for unix-domain sockets.  We don't use the socket structure's
+ * wait queue because it is allowed to 'go away' outside of our control,
+ * whereas unix_proto_data structures stick around.
+ */
+void unix_lock(struct unix_proto_data *upd)
+{
+	while (upd->lock_flag)
+		sleep_on(&upd->wait);
+	upd->lock_flag = 1;
+}
+
+
+void unix_unlock(struct unix_proto_data *upd)
+{
+	upd->lock_flag = 0;
+	wake_up(&upd->wait);
+}
 
 /* don't have to do anything. */
 static int
@@ -530,7 +554,7 @@ unix_proto_accept(struct socket *sock, struct socket *newsock, int flags)
   UN_DATA(newsock)->peerupd	       = UN_DATA(clientsock);
   UN_DATA(newsock)->sockaddr_un        = UN_DATA(sock)->sockaddr_un;
   UN_DATA(newsock)->sockaddr_len       = UN_DATA(sock)->sockaddr_len;
-  wake_up(clientsock->wait);
+  wake_up_interruptible(clientsock->wait);
   return(0);
 }
 
@@ -598,6 +622,8 @@ unix_proto_read(struct socket *sock, char *ubuf, int size, int nonblock)
    * Copy from the read buffer into the user's buffer,
    * watching for wraparound. Then we wake up the writer.
    */
+   
+  unix_lock(upd);
   do {
 	int part, cando;
 
@@ -612,14 +638,19 @@ unix_proto_read(struct socket *sock, char *ubuf, int size, int nonblock)
 	dprintf(1, "UNIX: read: avail=%d, todo=%d, cando=%d\n",
 	       					avail, todo, cando);
 	if((er=verify_area(VERIFY_WRITE,ubuf,cando))<0)
+	{
+		unix_unlock(upd);
 		return er;
+	}
 	memcpy_tofs(ubuf, upd->buf + upd->bp_tail, cando);
 	upd->bp_tail =(upd->bp_tail + cando) &(BUF_SIZE-1);
 	ubuf += cando;
 	todo -= cando;
-	if (sock->state == SS_CONNECTED) wake_up(sock->conn->wait);
+	if (sock->state == SS_CONNECTED)
+		wake_up_interruptible(sock->conn->wait);
 	avail = UN_BUF_AVAIL(upd);
   } while(todo && avail);
+  unix_unlock(upd);
   return(size - todo);
 }
 
@@ -666,6 +697,9 @@ unix_proto_write(struct socket *sock, char *ubuf, int size, int nonblock)
    * Copy from the user's buffer to the write buffer,
    * watching for wraparound. Then we wake up the reader.
    */
+   
+  unix_lock(pupd);
+  
   do {
 	int part, cando;
 
@@ -681,6 +715,7 @@ unix_proto_write(struct socket *sock, char *ubuf, int size, int nonblock)
 	 */
 	if (sock->state == SS_DISCONNECTING) {
 		send_sig(SIGPIPE, current, 1);
+		unix_unlock(pupd);
 		return(-EPIPE);
 	}
 	if ((cando = todo) > space) cando = space;
@@ -689,14 +724,19 @@ unix_proto_write(struct socket *sock, char *ubuf, int size, int nonblock)
 	       					space, todo, cando);
 	er=verify_area(VERIFY_READ, ubuf, cando);
 	if(er)
+	{
+		unix_unlock(pupd);
 		return er;
+	}
 	memcpy_fromfs(pupd->buf + pupd->bp_head, ubuf, cando);
 	pupd->bp_head =(pupd->bp_head + cando) &(BUF_SIZE-1);
 	ubuf += cando;
 	todo -= cando;
-	if (sock->state == SS_CONNECTED) wake_up(sock->conn->wait);
+	if (sock->state == SS_CONNECTED)
+		wake_up_interruptible(sock->conn->wait);
 	space = UN_BUF_SPACE(pupd);
   } while(todo && space);
+  unix_unlock(pupd);
   return(size - todo);
 }
 
@@ -840,6 +880,8 @@ unix_ioctl(struct inode *inode, struct file *file,
   }
   return(ret);
 }
+
+
 
 
 static struct file_operations unix_fops = {

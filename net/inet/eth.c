@@ -17,6 +17,7 @@
  *		Alan Cox	: eth_header ntohs should be htons
  *		Alan Cox	: eth_rebuild_header missing an htons and
  *				  minor other things.
+ *		Tegge		: Arp bug fixes. 
  *
  *		This program is free software; you can redistribute it and/or
  *		modify it under the terms of the GNU General Public License
@@ -124,7 +125,7 @@ eth_header(unsigned char *buff, struct device *dev, unsigned short type,
   cli();
   memcpy(eth->h_source, &saddr, 4);
   /* No. Ask ARP to resolve the Ethernet address. */
-  if (arp_find(eth->h_dest, daddr, dev, saddr)) 
+  if (arp_find(eth->h_dest, daddr, dev, dev->pa_addr)) 
   {
         sti();
         if(type!=ETH_P_IP)
@@ -155,7 +156,7 @@ eth_rebuild_header(void *buff, struct device *dev)
   DPRINTF((DBG_DEV, "ETH: RebuildHeader: SRC=%s ", in_ntoa(src)));
   DPRINTF((DBG_DEV, "DST=%s\n", in_ntoa(dst)));
   if(eth->h_proto!=htons(ETH_P_ARP))	/* This ntohs kind of helps a bit! */
-	  if (arp_find(eth->h_dest, dst, dev, src)) return(1);
+	  if (arp_find(eth->h_dest, dst, dev, dev->pa_addr /* src */)) return(1);
   memcpy(eth->h_source, dev->dev_addr, dev->addr_len);
   return(0);
 }
@@ -167,7 +168,7 @@ eth_add_arp(unsigned long addr, struct sk_buff *skb, struct device *dev)
 {
   struct ethhdr *eth;
 
-  eth = (struct ethhdr *) (skb + 1);
+  eth = (struct ethhdr *) skb->data;
   arp_add(addr, eth->h_source, dev);
 }
 
@@ -178,7 +179,7 @@ eth_type_trans(struct sk_buff *skb, struct device *dev)
 {
   struct ethhdr *eth;
 
-  eth = (struct ethhdr *) (skb + 1);
+  eth = (struct ethhdr *) skb->data;
 
   if(ntohs(eth->h_proto)<1536)
   	return(htons(ETH_P_802_3));

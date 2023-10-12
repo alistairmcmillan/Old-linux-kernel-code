@@ -101,6 +101,9 @@ repeat:
 		do_no_page(0,addr,tsk,0);
 		goto repeat;
 	}
+/* this is a hack for non-kernel-mapped video buffers and similar */
+	if (page >= high_memory)
+		return 0;
 	page &= PAGE_MASK;
 	page += addr & ~PAGE_MASK;
 	return *(unsigned long *) page;
@@ -139,6 +142,9 @@ repeat:
 		do_wp_page(PAGE_RW | PAGE_PRESENT,addr,tsk,0);
 		goto repeat;
 	}
+/* this is a hack for non-kernel-mapped video buffers and similar */
+	if (page >= high_memory)
+		return;
 /* we're bypassing pagetables, so we have to set the dirty bit ourselves */
 	*(unsigned long *) pte |= (PAGE_DIRTY|PAGE_COW);
 	page &= PAGE_MASK;
@@ -269,7 +275,7 @@ asmlinkage int sys_ptrace(long request, long pid, long addr, long data)
 	if (!(child->flags & PF_PTRACED))
 		return -ESRCH;
 	if (child->state != TASK_STOPPED) {
-		if (request != PTRACE_KILL && request != PTRACE_DETACH)
+		if (request != PTRACE_KILL)
 			return -ESRCH;
 	}
 	if (child->p_pptr != current)

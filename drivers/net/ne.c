@@ -17,7 +17,7 @@
 /* Routines for the NatSemi-based designs (NE[12]000). */
 
 static char *version =
-    "ne.c:v0.99-13s 11/17/93 Donald Becker (becker@super.org)\n";
+    "ne.c:v0.99-14a 12/3/93 Donald Becker (becker@super.org)\n";
 
 #include <linux/config.h>
 #include <linux/kernel.h>
@@ -25,9 +25,6 @@ static char *version =
 #include <linux/errno.h>
 #include <asm/system.h>
 #include <asm/io.h>
-#ifndef port_read
-#include "iow.h"
-#endif
 
 #include "dev.h"
 #include "8390.h"
@@ -104,7 +101,7 @@ static int neprobe1(int ioaddr, struct device *dev, int verbose)
     int wordlength = 2;
     char *name;
     int start_page, stop_page;
-    int neX000, ctron, dlink;
+    int neX000, ctron, dlink, dfi;
     int reg0 = inb(ioaddr);
 
     if ( reg0 == 0xFF)
@@ -151,8 +148,8 @@ static int neprobe1(int ioaddr, struct device *dev, int verbose)
 	    outb_p(program_seq[i].value, ioaddr + program_seq[i].offset);
     }
     for(i = 0; i < 32 /*sizeof(SA_prom)*/; i+=2) {
-	SA_prom[i] = inb_p(ioaddr + NE_DATAPORT);
-	SA_prom[i+1] = inb_p(ioaddr + NE_DATAPORT);
+	SA_prom[i] = inb(ioaddr + NE_DATAPORT);
+	SA_prom[i+1] = inb(ioaddr + NE_DATAPORT);
 	if (SA_prom[i] != SA_prom[i+1])
 	    wordlength = 1;
     }
@@ -179,12 +176,13 @@ static int neprobe1(int ioaddr, struct device *dev, int verbose)
     }
 #endif
 
-    neX000 =  (SA_prom[14] == 0x57  &&  SA_prom[15] == 0x57);
+    neX000 = (SA_prom[14] == 0x57  &&  SA_prom[15] == 0x57);
     ctron =  (SA_prom[0] == 0x00 && SA_prom[1] == 0x00 && SA_prom[2] == 0x1d);
     dlink =  (SA_prom[0] == 0x00 && SA_prom[1] == 0xDE && SA_prom[2] == 0x01);
+    dfi   =  (SA_prom[0] == 'D' && SA_prom[1] == 'F' && SA_prom[2] == 'I');
 
     /* Set up the rest of the parameters. */
-    if (neX000 || dlink) {
+    if (neX000 || dlink || dfi) {
 	if (wordlength == 2) {
 	    name = dlink ? "DE200" : "NE2000";
 	    start_page = NESM_START_PG;
@@ -305,11 +303,11 @@ ne_block_input(struct device *dev, int count, char *buf, int ring_offset)
     outb_p(ring_offset >> 8, nic_base + EN0_RSARHI);
     outb_p(E8390_RREAD+E8390_START, nic_base + NE_CMD);
     if (ei_status.word16) {
-      port_read(NE_BASE + NE_DATAPORT,buf,count>>1);
+      insw(NE_BASE + NE_DATAPORT,buf,count>>1);
       if (count & 0x01)
 	buf[count-1] = inb(NE_BASE + NE_DATAPORT), xfer_count++;
     } else {
-	port_read_b(NE_BASE + NE_DATAPORT, buf, count);
+	insb(NE_BASE + NE_DATAPORT, buf, count);
     }
 
     /* This was for the ALPHA version only, but enough people have
@@ -384,9 +382,9 @@ ne_block_output(struct device *dev, int count,
 
     outb_p(E8390_RWRITE+E8390_START, nic_base + NE_CMD);
     if (ei_status.word16) {
-	port_write(NE_BASE + NE_DATAPORT, buf, count>>1);
+	outsw(NE_BASE + NE_DATAPORT, buf, count>>1);
     } else {
-	port_write_b(NE_BASE + NE_DATAPORT, buf, count);
+	outsb(NE_BASE + NE_DATAPORT, buf, count);
     }
 
     /* This was for the ALPHA version only, but enough people have

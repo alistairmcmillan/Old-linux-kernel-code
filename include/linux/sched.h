@@ -13,6 +13,21 @@
 
 #define HZ 100
 
+/*
+ * System setup flags..
+ */
+extern int hard_math;
+extern int x86;
+extern int ignore_irq13;
+extern int wp_works_ok;
+
+/*
+ * Bus types (default is ISA, but people can check others with these..)
+ * MCA_bus hardcoded to 0 for now.
+ */
+extern int EISA_bus;
+#define MCA_bus 0
+
 #include <linux/tasks.h>
 #include <asm/system.h>
 
@@ -145,7 +160,7 @@ struct tss_struct {
 	unsigned short	trace, bitmap;
 	unsigned long	io_bitmap[IO_BITMAP_SIZE+1];
 	unsigned long	tr;
-	unsigned long	cr2;
+	unsigned long	cr2, trap_no, error_code;
 	union i387_union i387;
 };
 
@@ -277,7 +292,7 @@ struct task_struct {
 	 _LDT(0),0, \
 	 0, 0x8000, \
 /* ioperm */ 	{~0, }, \
-	 _TSS(0), 0, \
+	 _TSS(0), 0, 0,0, \
 /* 387 state */	{ { 0, }, } \
 	} \
 }
@@ -289,11 +304,6 @@ extern struct task_struct *current;
 extern unsigned long volatile jiffies;
 extern struct timeval xtime;
 extern int need_resched;
-
-extern int hard_math;
-extern int x86;
-extern int ignore_irq13;
-extern int wp_works_ok;
 
 #define CURRENT_TIME (xtime.tv_sec)
 

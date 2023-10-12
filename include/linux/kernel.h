@@ -14,11 +14,6 @@
 #define LONG_MAX	((long)(~0UL>>1))
 #define ULONG_MAX	(~0UL)
 
-#define VERIFY_READ 0
-#define VERIFY_WRITE 1
-
-int verify_area(int type, void * addr, unsigned long count);
-
 #define	KERN_EMERG	"<0>"	/* system is unusable			*/
 #define	KERN_ALERT	"<1>"	/* action must be taken immediately	*/
 #define	KERN_CRIT	"<2>"	/* critical conditions			*/
@@ -28,7 +23,7 @@ int verify_area(int type, void * addr, unsigned long count);
 #define	KERN_INFO	"<6>"	/* informational			*/
 #define	KERN_DEBUG	"<7>"	/* debug-level messages			*/
 
-#if __GNUC__ < 2 || __GNUC_MINOR__ < 5
+#if __GNUC__ < 2 || (__GNUC__ == 2 && __GNUC_MINOR__ < 5)
 # define NORET_TYPE    __volatile__
 # define ATTRIB_NORET  /**/
 # define NORET_AND     /**/

@@ -14,10 +14,10 @@ CPP := $(CPP) -I../../net/inet
 # The point of the makefile...
 all: net.a
 
-Space.o: Space.c /usr/include/linux/autoconf.h
+Space.o: Space.c ../../include/linux/autoconf.h
 	$(CC) $(CFLAGS) $(OPTS) $(DL_OPTS) -c $< -o $@
 
-net_init.o: /usr/include/linux/autoconf.h
+net_init.o: ../../include/linux/autoconf.h
 
 ifdef CONFIG_WD80x3
 NETDRV_OBJS := $(NETDRV_OBJS) net.a(wd.o)
@@ -70,7 +70,7 @@ endif
 ifdef CONFIG_SLIP
 NETDRV_OBJS := $(NETDRV_OBJS) net.a(slip.o) net.a(slhc.o)
 slip.o:	slip.c CONFIG
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(SLIP_OPTS) -c $<
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $<
 endif
 
 ifdef CONFIG_DE600

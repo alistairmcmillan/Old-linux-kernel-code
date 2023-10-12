@@ -2,6 +2,7 @@
  *  kernel/chr_drv/vt.c
  *
  *  Copyright (C) 1992 obz under the linux copyright
+ *  Dynamic diacritical handling - aeb@cwi.nl - Dec 1993
  */
 
 #include <linux/types.h>
@@ -10,7 +11,6 @@
 #include <linux/tty.h>
 #include <linux/timer.h>
 #include <linux/kernel.h>
-#include <linux/keyboard.h>
 #include <linux/kd.h>
 #include <linux/vt.h>
 #include <linux/string.h>
@@ -18,7 +18,9 @@
 #include <asm/io.h>
 #include <asm/segment.h>
 
+#include "kbd_kern.h"
 #include "vt_kern.h"
+#include "diacr.h"
 
 /*
  * Console (vt and kd) routines, as defined by USL SVR4 manual, and by
@@ -37,9 +39,18 @@ struct vt_struct vt_cons[NR_CONSOLES];
 
 asmlinkage int sys_ioperm(unsigned long from, unsigned long num, int on);
 
+extern void compute_shiftstate(void);
 extern void change_console(unsigned int new_console);
 extern void complete_change_console(unsigned int new_console);
 extern int vt_waitactive(void);
+
+/*
+ * routines to load custom translation table and EGA/VGA font from console.c
+ */
+extern int con_set_trans(char * table);
+extern int con_get_trans(char * table);
+extern int con_set_font(char * fontmap);
+extern int con_get_font(char * fontmap);
 
 /*
  * these are the valid i/o ports we're allowed to change. they map all the
@@ -206,29 +217,57 @@ int vt_ioctl(struct tty_struct *tty, struct file * file,
 		return -EINVAL;
 
 	case KDSKBMODE:
-		if (arg == K_RAW) {
-			set_vc_kbd_flag(kbd, VC_RAW);
-			clr_vc_kbd_flag(kbd, VC_MEDIUMRAW);
-		} else if (arg == K_XLATE) {
-			clr_vc_kbd_flag(kbd, VC_RAW);
-			clr_vc_kbd_flag(kbd, VC_MEDIUMRAW);
-		} else if (arg == K_MEDIUMRAW) {
-			clr_vc_kbd_flag(kbd, VC_RAW);
-			set_vc_kbd_flag(kbd, VC_MEDIUMRAW);
-		} else
+		switch(arg) {
+		  case K_RAW:
+		        set_vc_kbd_mode(kbd, VC_RAW);
+			clr_vc_kbd_mode(kbd, VC_MEDIUMRAW);
+			break;
+		  case K_MEDIUMRAW:
+			clr_vc_kbd_mode(kbd, VC_RAW);
+			set_vc_kbd_mode(kbd, VC_MEDIUMRAW);
+			break;
+		  case K_XLATE:
+			clr_vc_kbd_mode(kbd, VC_RAW);
+			clr_vc_kbd_mode(kbd, VC_MEDIUMRAW);
+			compute_shiftstate();
+			break;
+		  default:
 			return -EINVAL;
+		}
 		flush_input(tty);
 		return 0;
 
 	case KDGKBMODE:
 		i = verify_area(VERIFY_WRITE, (void *) arg, sizeof(unsigned long));
 		if (!i) {
-			ucval = vc_kbd_flag(kbd, VC_RAW);
-			if (vc_kbd_flag(kbd, VC_MEDIUMRAW))
-				put_fs_long(K_MEDIUMRAW, (unsigned long *) arg);
-			else
-				put_fs_long(ucval ? K_RAW : K_XLATE,
-					(unsigned long *) arg);
+			ucval = (vc_kbd_mode(kbd, VC_RAW) ? K_RAW :
+				 vc_kbd_mode(kbd, VC_MEDIUMRAW) ? K_MEDIUMRAW :
+				 K_XLATE);
+			put_fs_long(ucval, (unsigned long *) arg);
+		}
+		return i;
+
+	/* this could be folded into KDSKBMODE, but for compatibility
+	   reasons it is not so easy to fold KDGKBMETA into KDGKBMODE */
+	case KDSKBMETA:
+		switch(arg) {
+		  case K_METABIT:
+			clr_vc_kbd_mode(kbd, VC_META);
+			break;
+		  case K_ESCPREFIX:
+			set_vc_kbd_mode(kbd, VC_META);
+			break;
+		  default:
+			return -EINVAL;
+		}
+		return 0;
+
+	case KDGKBMETA:
+		i = verify_area(VERIFY_WRITE, (void *) arg, sizeof(unsigned long));
+		if (!i) {
+			ucval = (vc_kbd_mode(kbd, VC_META) ? K_ESCPREFIX :
+				 K_METABIT);
+			put_fs_long(ucval, (unsigned long *) arg);
 		}
 		return i;
 
@@ -254,7 +293,7 @@ int vt_ioctl(struct tty_struct *tty, struct file * file,
 		u_char s;
 		u_short v;
 
-		i = verify_area(VERIFY_WRITE, (void *)a, sizeof(struct kbentry));
+		i = verify_area(VERIFY_READ, (void *)a, sizeof(struct kbentry));
 		if (i)
 			return i;
 		if ((i = get_fs_byte((char *) &a->kb_index)) >= NR_KEYS)
@@ -278,10 +317,17 @@ int vt_ioctl(struct tty_struct *tty, struct file * file,
 		i = verify_area(VERIFY_WRITE, (void *)a, sizeof(struct kbsentry));
 		if (i)
 			return i;
-		if ((i = get_fs_byte(&a->kb_func)) >= NR_FUNC)
+		if ((i = get_fs_byte(&a->kb_func)) >= NR_FUNC || i < 0)
 			return -EINVAL;
 		q = a->kb_string;
-		for (p = func_table[i]; *p; p++)
+		p = func_table[i];
+		if(!p) {
+		    /* beware of tables generated for a smaller NR_FUNC */
+		    printk("KDGKBSENT error: func_table[%d] is nil.\n",
+			   i);
+		    return -EINVAL;
+		}
+		for ( ; *p; p++)
 			put_fs_byte(*p, q++);
 		put_fs_byte(0, q);
 		return 0;
@@ -301,7 +347,14 @@ int vt_ioctl(struct tty_struct *tty, struct file * file,
 			return i;
 		if ((i = get_fs_byte(&a->kb_func)) >= NR_FUNC)
 			return -EINVAL;
-		delta = -strlen(func_table[i]);
+		q = func_table[i];
+		if (!q) {
+		    /* beware of tables generated for a smaller NR_FUNC */
+		    printk("KDSKBSENT error: func_table[%d] is nil.\n",
+			   i);
+		    return -EINVAL;
+		}
+		delta = -strlen(q);
 		for (p = a->kb_string; get_fs_byte(p); p++)
 			delta++;
 		first_free = func_table[NR_FUNC - 1] +
@@ -317,6 +370,7 @@ int vt_ioctl(struct tty_struct *tty, struct file * file,
 				func_table[i + 1],
 				first_free - func_table[i + 1]);
 			for (k = i + 1; k < NR_FUNC; k++)
+			    if (func_table[k])  /* just to be sure */
 				func_table[k] += delta;
 		}
 		for (p = a->kb_string, q = func_table[i]; ; p++, q++)
@@ -325,35 +379,46 @@ int vt_ioctl(struct tty_struct *tty, struct file * file,
 		return 0;
 	}
 
+	case KDGKBDIACR:
+	{
+	        struct kbdiacrs *a = (struct kbdiacrs *)arg;
+
+	        i = verify_area(VERIFY_WRITE, (void *) a, sizeof(struct kbdiacrs));
+		if (i)
+		        return i;
+		put_fs_long(accent_table_size, &a->kb_cnt);
+		memcpy_tofs(a->kbdiacr, accent_table,
+			    accent_table_size*sizeof(struct kbdiacr));
+		return 0;
+	}
+
+	case KDSKBDIACR:
+	{
+	        struct kbdiacrs *a = (struct kbdiacrs *)arg;
+		unsigned int ct;
+
+	        i = verify_area(VERIFY_READ, (void *) a, sizeof(struct kbdiacrs));
+		if (i)
+		        return i;
+		ct = get_fs_long(&a->kb_cnt);
+		if (ct >= MAX_DIACR)
+		        return -EINVAL;
+		accent_table_size = ct;
+		memcpy_fromfs(accent_table, a->kbdiacr, ct*sizeof(struct kbdiacr));
+		return 0;
+	}
+
 	case KDGETLED:
 		i = verify_area(VERIFY_WRITE, (void *) arg, sizeof(unsigned char));
 		if (i)
 			return i;
-		ucval = 0;
-		if (vc_kbd_flag(kbd, VC_SCROLLOCK))
-			ucval |= LED_SCR;
-		if (vc_kbd_flag(kbd, VC_NUMLOCK))
-			ucval |= LED_NUM;
-		if (vc_kbd_flag(kbd, VC_CAPSLOCK))
-			ucval |= LED_CAP;
-		put_fs_byte(ucval, (char *) arg);
+		put_fs_byte(kbd->ledstate, (char *) arg);
 		return 0;
 
 	case KDSETLED:
 		if (arg & ~7)
 			return -EINVAL;
-		if (arg & LED_SCR)
-			set_vc_kbd_flag(kbd, VC_SCROLLOCK);
-		else
-			clr_vc_kbd_flag(kbd, VC_SCROLLOCK);
-		if (arg & LED_NUM)
-			set_vc_kbd_flag(kbd, VC_NUMLOCK);
-		else
-			clr_vc_kbd_flag(kbd, VC_NUMLOCK);
-		if (arg & LED_CAP)
-			set_vc_kbd_flag(kbd, VC_CAPSLOCK);
-		else
-			clr_vc_kbd_flag(kbd, VC_CAPSLOCK);
+		kbd->ledstate = arg;
 		set_leds();
 		return 0;
 
@@ -503,6 +568,22 @@ int vt_ioctl(struct tty_struct *tty, struct file * file,
 		}
 
 		return 0;
+
+	case PIO_FONT:
+		return con_set_font((char *)arg);
+		/* con_set_font() defined in console.c */
+
+	case GIO_FONT:
+		return con_get_font((char *)arg);
+		/* con_get_font() defined in console.c */
+
+	case PIO_SCRNMAP:
+		return con_set_trans((char *)arg);
+		/* con_set_trans() defined in console.c */
+
+	case GIO_SCRNMAP:
+		return con_get_trans((char *)arg);
+		/* con_get_trans() defined in console.c */
 
 	default:
 		return -EINVAL;

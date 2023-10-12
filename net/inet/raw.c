@@ -18,6 +18,11 @@
  *					library. No more peek crashes, no more backlogs
  *		Alan Cox	:	Checks sk->broadcast.
  *		Alan Cox	:	Uses skb_free_datagram/skb_copy_datagram
+ *		Alan Cox	:	Raw passes ip options too
+ *		Alan Cox	:	Setsocketopt added
+ *		Alan Cox	:	Fixed error return for broadcasts
+ *		Alan Cox	:	Removed wake_up calls
+ *		Alan Cox	:	Use ttl/tos
  *
  *		This program is free software; you can redistribute it and/or
  *		modify it under the terms of the GNU General Public License
@@ -75,7 +80,7 @@ raw_err (int err, unsigned char *header, unsigned long daddr,
   }
 
   sk->err = icmp_err_convert[err & 0xff].errno;
-  wake_up(sk->sleep);
+  sk->error_report(sk);
   
   return;
 }
@@ -109,7 +114,8 @@ raw_rcv(struct sk_buff *skb, struct device *dev, struct options *opt,
 
   /* Now we need to copy this into memory. */
   skb->sk = sk;
-  skb->len = len;
+  skb->len = len + skb->ip_hdr->ihl*sizeof(long);
+  skb->h.raw = skb->ip_hdr;
   skb->dev = dev;
   skb->saddr = daddr;
   skb->daddr = saddr;
@@ -122,7 +128,7 @@ raw_rcv(struct sk_buff *skb, struct device *dev, struct options *opt,
   }
   sk->rmem_alloc += skb->mem_len;
   skb_queue_tail(&sk->rqueue,skb);
-  wake_up(sk->sleep);
+  sk->data_ready(sk,skb->len);
   release_sock(sk);
   return(0);
 }
@@ -168,7 +174,7 @@ raw_sendto(struct sock *sk, unsigned char *from, int len,
   if (sin.sin_port == 0) sin.sin_port = sk->protocol;
   
   if (sk->broadcast == 0 && chk_addr(sin.sin_addr.s_addr)==IS_BROADCAST)
-  	return -ENETUNREACH;
+  	return -EACCES;
 
   sk->inuse = 1;
   skb = NULL;
@@ -181,7 +187,7 @@ raw_sendto(struct sock *sk, unsigned char *from, int len,
   		return(err);
   	}
   	
-	skb = (struct sk_buff *) sk->prot->wmalloc(sk,
+	skb = sk->prot->wmalloc(sk,
 			len+sizeof(*skb) + sk->prot->max_header,
 			0, GFP_KERNEL);
 	if (skb == NULL) {
@@ -213,7 +219,7 @@ raw_sendto(struct sock *sk, unsigned char *from, int len,
 
   tmp = sk->prot->build_header(skb, sk->saddr, 
 			       sin.sin_addr.s_addr, &dev,
-			       sk->protocol, sk->opt, skb->mem_len);
+			       sk->protocol, sk->opt, skb->mem_len, sk->ip_tos,sk->ip_ttl);
   if (tmp < 0) {
 	DPRINTF((DBG_RAW, "raw_sendto: error building ip header.\n"));
 	kfree_skb(skb,FREE_WRITE);
@@ -222,7 +228,7 @@ raw_sendto(struct sock *sk, unsigned char *from, int len,
   }
 
   /* verify_area(VERIFY_WRITE, from, len);*/
-  memcpy_fromfs ((unsigned char *)(skb+1)+tmp, from, len);
+  memcpy_fromfs(skb->data + tmp, from, len);
 
   /* If we are using IPPROTO_RAW, we need to fill in the source address in
      the IP header */
@@ -231,7 +237,7 @@ raw_sendto(struct sock *sk, unsigned char *from, int len,
     unsigned char *buff;
     struct iphdr *iph;
 
-    buff = (unsigned char *)(skb + 1);
+    buff = skb->data;
     buff += tmp;
     iph = (struct iphdr *)buff;
     iph->saddr = sk->saddr;
@@ -329,6 +335,13 @@ raw_recvfrom(struct sock *sk, unsigned char *to, int len,
 		return err;
 	put_fs_long(sizeof(*sin), addr_len);
   }
+  if(sin)
+  {
+  	err=verify_area(VERIFY_WRITE, sin, sizeof(*sin));
+	if(err)
+		return err;
+  }
+  
   err=verify_area(VERIFY_WRITE,to,len);
   if(err)
   	return err;
@@ -347,7 +360,6 @@ raw_recvfrom(struct sock *sk, unsigned char *to, int len,
 
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = skb->daddr;
-	verify_area(VERIFY_WRITE, sin, sizeof(*sin));
 	memcpy_tofs(sin, &addr, sizeof(*sin));
   }
 
@@ -389,6 +401,8 @@ struct proto raw_prot = {
   NULL,
   raw_init,
   NULL,
+  ip_setsockopt,
+  ip_getsockopt,
   128,
   0,
   {NULL,},

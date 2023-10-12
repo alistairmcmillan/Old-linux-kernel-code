@@ -9,6 +9,7 @@
  */
 #include <linux/sched.h>
 #include <linux/kernel.h>
+#include <linux/kernel_stat.h>
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/config.h>
@@ -17,6 +18,10 @@
 #include <asm/system.h>
 
 #include "blk.h"
+
+#ifdef CONFIG_SBPCD
+extern u_long sbpcd_init(u_long, u_long);
+#endif CONFIG_SBPCD
 
 /*
  * The request-struct contains all necessary data
@@ -402,6 +407,10 @@ void ll_rw_block(int rw, int nr, struct buffer_head * bh[])
 		if (bh[i]) {
 			bh[i]->b_req = 1;
 			make_request(major, rw, bh[i]);
+			if (rw == READ || rw == READA)
+				kstat.pgpgin++;
+			else
+				kstat.pgpgout++;
 		}
 	}
 	if (plugged) {
@@ -485,6 +494,9 @@ long blk_dev_init(long mem_start, long mem_end)
 #ifdef CONFIG_MCD
 	mem_start = mcd_init(mem_start,mem_end);
 #endif
+#ifdef CONFIG_SBPCD
+	mem_start = sbpcd_init(mem_start, mem_end);
+#endif CONFIG_SBPCD
 	if (ramdisk_size)
 		mem_start += rd_init(mem_start, ramdisk_size*1024);
 	return mem_start;

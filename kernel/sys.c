@@ -7,7 +7,6 @@
 #include <linux/config.h>
 #include <linux/errno.h>
 #include <linux/sched.h>
-#include <linux/tty.h>
 #include <linux/kernel.h>
 #include <linux/times.h>
 #include <linux/utsname.h>
@@ -490,6 +489,19 @@ asmlinkage int sys_setpgid(pid_t pid, pid_t pgid)
 	return -ESRCH;
 }
 
+asmlinkage int sys_getpgid(pid_t pid)
+{
+	struct task_struct * p;
+
+	if (!pid)
+		return current->pgrp;
+	for_each_task(p) {
+		if (p->pid == pid)
+			return p->pgrp;
+	}
+	return -ESRCH;
+}
+
 asmlinkage int sys_getpgrp(void)
 {
 	return current->pgrp;
@@ -497,7 +509,7 @@ asmlinkage int sys_getpgrp(void)
 
 asmlinkage int sys_setsid(void)
 {
-	if (current->leader && !suser())
+	if (current->leader)
 		return -EPERM;
 	current->leader = 1;
 	current->session = current->pgrp = current->pid;

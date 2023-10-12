@@ -17,25 +17,31 @@
  *		Matt Dillon	:	Printable slip (borrowed from NET2E)
  *	Pauline Middelink	:	Slip driver fixes.
  *		Alan Cox	:	Honours the old SL_COMPRESSED flag
+ *		Alan Cox	:	KISS AX.25 and AXUI IP support
+ *		Michael Riepe	:	Automatic CSLIP recognition added
  */
+ 
 #include <asm/segment.h>
 #include <asm/system.h>
+
+#include <linux/config.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/string.h>
 #include <linux/mm.h>
 #include <linux/socket.h>
-#include <linux/termios.h>
 #include <linux/sockios.h>
 #include <linux/interrupt.h>
 #include <linux/tty.h>
 #include <linux/errno.h>
 #include <linux/stat.h>
-#include <linux/tty.h>
 #include <linux/in.h>
 #include "inet.h"
 #include "dev.h"
+#ifdef CONFIG_AX25
+#include "ax25.h"
+#endif
 #include "eth.h"
 #include "ip.h"
 #include "route.h"
@@ -46,7 +52,6 @@
 #include "arp.h"
 #include "slip.h"
 #include "slhc.h"
-
 
 #define	SLIP_VERSION	"0.7.5"
 
@@ -129,10 +134,14 @@ sl_initialize(struct slip *sl, struct device *dev)
   sl->sending		= 0;
   sl->escape		= 0;
   sl->flags		= 0;
+#ifdef SL_ADAPTIVE
+  sl->mode		= SL_MODE_ADAPTIVE;	/* automatic CSLIP recognition */
+#else
 #ifdef SL_COMPRESSED
-  sl->mode		= SL_MODE_CSLIP;	/* Default */
+  sl->mode		= SL_MODE_CSLIP | SL_MODE_ADAPTIVE;	/* Default */
 #else
   sl->mode		= SL_MODE_SLIP;		/* Default for non compressors */
+#endif
 #endif  
 
   sl->line		= dev->base_addr;
@@ -345,8 +354,15 @@ sl_bump(struct slip *sl)
   int count;
 
   count = sl->rcount;
-  if (sl->mode & SL_MODE_CSLIP) {
+  if (sl->mode & (SL_MODE_ADAPTIVE | SL_MODE_CSLIP)) {
     if ((c = sl->rbuff[0]) & SL_TYPE_COMPRESSED_TCP) {
+#if 1
+      /* ignore compressed packets when CSLIP is off */
+      if (!(sl->mode & SL_MODE_CSLIP)) {
+	printk("SLIP: compressed packet ignored\n");
+	return;
+      }
+#endif
       /* make sure we've reserved enough space for uncompress to use */
       save_flags(flags);
       cli();
@@ -368,6 +384,11 @@ sl_bump(struct slip *sl)
 	return;
       }
     } else if (c >= SL_TYPE_UNCOMPRESSED_TCP) {
+      if (!(sl->mode & SL_MODE_CSLIP)) {
+	/* turn on header compression */
+	sl->mode |= SL_MODE_CSLIP;
+	printk("SLIP: header compression turned on\n");
+      }
       sl->rbuff[0] &= 0x4f;
       if (slhc_remember(sl->slcomp, sl->rbuff, count) <= 0) {
 	sl->errors++;
@@ -479,6 +500,21 @@ sl_encaps(struct slip *sl, unsigned char *icp, int len)
   }
 }
 
+/*static void sl_hex_dump(unsigned char *x,int l)
+{
+	int n=0;
+	printk("sl_xmit: (%d bytes)\n",l);
+	while(l)
+	{
+		printk("%2X ",(int)*x++);
+		l--;
+		n++;
+		if(n%32==0)
+			printk("\n");
+	}
+	if(n%32)
+		printk("\n");
+}*/
 
 /* Encapsulate an IP datagram and kick it into a TTY queue. */
 static int
@@ -506,18 +542,36 @@ sl_xmit(struct sk_buff *skb, struct device *dev)
 
   /* We were not, so we are now... :-) */
   if (skb != NULL) {
+#ifdef CONFIG_AX25  
+  	if(sl->mode & SL_MODE_AX25)
+  	{
+  		if(!skb->arp && dev->rebuild_header(skb->data,dev))
+  		{
+  			skb->dev=dev;
+  			arp_queue(skb);
+  			return 0;
+  		}
+  		skb->arp=1;
+  	}
+#endif  	
 	sl_lock(sl);
-	sl_encaps(sl, (unsigned char *) (skb + 1), skb->len);
+/*	sl_hex_dump(skb->data,skb->len);*/
+	sl_encaps(sl, skb->data, skb->len);
 	if (skb->free) kfree_skb(skb, FREE_WRITE);
   }
   return(0);
 }
 
 
-/* Return the frame type ID.  This is always IP. */
+/* Return the frame type ID.  This is normally IP but maybe be AX.25. */
 static unsigned short
 sl_type_trans (struct sk_buff *skb, struct device *dev)
 {
+#ifdef CONFIG_AX25
+	struct slip *sl=&sl_ctrl[dev->base_addr];
+	if(sl->mode&SL_MODE_AX25)
+		return(NET16(ETH_P_AX25));
+#endif
   return(NET16(ETH_P_IP));
 }
 
@@ -527,6 +581,12 @@ static int
 sl_header(unsigned char *buff, struct device *dev, unsigned short type,
 	  unsigned long daddr, unsigned long saddr, unsigned len)
 {
+#ifdef CONFIG_AX25
+  struct slip *sl=&sl_ctrl[dev->base_addr];
+  if((sl->mode&SL_MODE_AX25) && type!=NET16(ETH_P_AX25))
+  	return ax25_encapsulate_ip(buff,dev,type,daddr,saddr,len);
+#endif  
+
   return(0);
 }
 
@@ -535,6 +595,12 @@ sl_header(unsigned char *buff, struct device *dev, unsigned short type,
 static void
 sl_add_arp(unsigned long addr, struct sk_buff *skb, struct device *dev)
 {
+#ifdef CONFIG_AX25
+	struct slip *sl=&sl_ctrl[dev->base_addr];
+	
+	if(sl->mode&SL_MODE_AX25)
+		arp_add(addr,((char *) skb->data)+8,dev);
+#endif		
 }
 
 
@@ -542,6 +608,12 @@ sl_add_arp(unsigned long addr, struct sk_buff *skb, struct device *dev)
 static int
 sl_rebuild_header(void *buff, struct device *dev)
 {
+#ifdef CONFIG_AX25
+  struct slip *sl=&sl_ctrl[dev->base_addr];
+  
+  if(sl->mode&SL_MODE_AX25)
+  	return ax25_rebuild_header(buff,dev);
+#endif  
   return(0);
 }
 
@@ -614,6 +686,10 @@ sl_open(struct device *dev)
 	return(-ENOMEM);
   }
 
+  dev->flags|=IFF_UP;
+  /* Needed because address '0' is special */
+  if(dev->pa_addr==0)
+  	dev->pa_addr=ntohl(0xC0000001);
   DPRINTF((DBG_SLIP, "SLIP: channel %d opened.\n", sl->line));
   return(0);
 }
@@ -746,6 +822,37 @@ slip_open(struct tty_struct *tty)
   return(sl->line);
 }
 
+ 
+static struct enet_statistics *
+sl_get_stats(struct device *dev)
+{
+    static struct enet_statistics stats;
+    struct slip *sl;
+    struct slcompress *comp;
+
+    /* Find the correct SLIP channel to use. */
+    sl = &sl_ctrl[dev->base_addr];
+    if (! sl)
+      return NULL;
+
+    memset(&stats, 0, sizeof(struct enet_statistics));
+
+    stats.rx_packets = sl->rpacket;
+    stats.rx_over_errors = sl->roverrun;
+    stats.tx_packets = sl->spacket;
+    stats.tx_dropped = sl->sbusy;
+    stats.rx_errors = sl->errors;
+
+    comp = sl->slcomp;
+    if (comp) {
+      stats.rx_fifo_errors = comp->sls_i_compressed;
+      stats.rx_dropped = comp->sls_i_tossed;
+      stats.tx_fifo_errors = comp->sls_o_compressed;
+      stats.collisions = comp->sls_o_misses;
+    }
+
+    return (&stats);
+}
 
 /*
  * Close down a SLIP channel.
@@ -938,6 +1045,20 @@ slip_close(struct tty_struct *tty)
      	sl->flags |= SLF_ERROR;
  }
 
+
+#ifdef CONFIG_AX25
+
+int sl_set_mac_address(struct device *dev, void *addr)
+{
+	int err=verify_area(VERIFY_READ,addr,7);
+	if(err)
+		return err;
+	memcpy_fromfs(dev->dev_addr,addr,7);	/* addr is an AX.25 shifted ASCII mac address */
+	return 0;
+}
+#endif
+
+
 /* Perform I/O control on an active SLIP channel. */
 static int
 slip_ioctl(struct tty_struct *tty, void *file, int cmd, void *arg)
@@ -966,7 +1087,25 @@ slip_ioctl(struct tty_struct *tty, void *file, int cmd, void *arg)
 	case SIOCSIFENCAP:
 		err=verify_area(VERIFY_READ,arg,sizeof(long));
 		sl->mode=get_fs_long((long *)arg);
+#ifdef CONFIG_AX25		
+		if(sl->mode & SL_MODE_AX25)
+		{
+			sl->dev->addr_len=7;	/* sizeof an AX.25 addr */
+			sl->dev->hard_header_len=17;	/* We don't do digipeaters */
+			sl->dev->type=3;		/* AF_AX25 not an AF_INET device */
+		}
+		else
+		{
+			sl->dev->addr_len=0;	/* No mac addr in slip mode */
+			sl->dev->hard_header_len=0;
+			sl->dev->type=0;
+		}
+#endif		
 		return(0);
+	case SIOCSIFHWADDR:
+#ifdef CONFIG_AX25	
+		return sl_set_mac_address(sl->dev,arg);
+#endif
 	default:
 		return(-EINVAL);
   }
@@ -980,6 +1119,10 @@ slip_init(struct device *dev)
 {
   struct slip *sl;
   int i;
+#ifdef CONFIG_AX25  
+  static char ax25_bcast[7]={'Q'<<1,'S'<<1,'T'<<1,' '<<1,' '<<1,' '<<1,'0'<<1};
+  static char ax25_test[7]={'L'<<1,'I'<<1,'N'<<1,'U'<<1,'X'<<1,' '<<1,'1'<<1};
+#endif
 
   sl = &sl_ctrl[dev->base_addr];
 
@@ -987,6 +1130,9 @@ slip_init(struct device *dev)
 	printk("SLIP: version %s (%d channels)\n",
 				SLIP_VERSION, SL_NRUNIT);
 	printk("CSLIP: code copyright 1989 Regents of the University of California\n");
+#ifdef CONFIG_AX25
+	printk("AX25: KISS encapsulation enabled\n");
+#endif	
 	/* Fill in our LDISC request block. */
 	sl_ldisc.flags	= 0;
 	sl_ldisc.open	= slip_open;
@@ -995,9 +1141,10 @@ slip_init(struct device *dev)
 	sl_ldisc.write	= NULL;
 	sl_ldisc.ioctl	= (int (*)(struct tty_struct *, struct file *,
 				   unsigned int, unsigned long)) slip_ioctl;
+	sl_ldisc.select = NULL;
 	sl_ldisc.handler = slip_recv;
-	if ((i = tty_register_ldisc(N_SLIP, &sl_ldisc)) == 0) printk("OK\n");
-	  else printk("ERROR: %d\n", i);
+	if ((i = tty_register_ldisc(N_SLIP, &sl_ldisc)) != 0)
+		printk("ERROR: %d\n", i);
   }
 
   /* Set up the "SLIP Control Block". */
@@ -1019,9 +1166,19 @@ slip_init(struct device *dev)
   dev->hard_header	= sl_header;
   dev->add_arp		= sl_add_arp;
   dev->type_trans	= sl_type_trans;
+  dev->get_stats	= sl_get_stats;
+#ifdef HAVE_SET_MAC_ADDR
+#ifdef CONFIG_AX25
+  dev->set_mac_address  = sl_set_mac_address;
+#endif
+#endif
   dev->hard_header_len	= 0;
   dev->addr_len		= 0;
   dev->type		= 0;
+#ifdef CONFIG_AX25  
+  memcpy(dev->broadcast,ax25_bcast,7);		/* Only activated in AX.25 mode */
+  memcpy(dev->dev_addr,ax25_test,7);		/*    ""      ""       ""    "" */
+#endif  
   dev->queue_xmit	= dev_queue_xmit;
   dev->rebuild_header	= sl_rebuild_header;
   for (i = 0; i < DEV_NUMBUFFS; i++)

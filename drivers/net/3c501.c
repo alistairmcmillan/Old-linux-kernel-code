@@ -2,9 +2,6 @@
 /*
     Copyright (C) 1992,1993  Donald Becker
 
-    This is alpha test code.  No redistribution is permitted.
-
-    If this code is distributed, it will carry the following:
     Copyright 1993 United States Government as represented by the
     Director, National Security Agency.  This software may be used and
     distributed according to the terms of the GNU Public License,
@@ -41,7 +38,6 @@ static char *version =
 #include <errno.h>
 
 #include "dev.h"
-#include "iow.h"
 #include "eth.h"
 #include "skbuff.h"
 #include "arp.h"
@@ -296,7 +292,7 @@ el_start_xmit(struct sk_buff *skb, struct device *dev)
     }
 
     /* Fill in the ethernet header. */
-    if (!skb->arp  &&  dev->rebuild_header(skb+1, dev)) {
+    if (!skb->arp  &&  dev->rebuild_header(skb->data, dev)) {
 	skb->dev = dev;
 	arp_queue (skb);
 	return 0;
@@ -314,7 +310,7 @@ el_start_xmit(struct sk_buff *skb, struct device *dev)
 	printk("%s: Transmitter access conflict.\n", dev->name);
     else {
 	int gp_start = 0x800 - (ETH_ZLEN < skb->len ? skb->len : ETH_ZLEN);
-	unsigned char *buf = (void *)(skb+1);
+	unsigned char *buf = skb->data;
 
 	el_status.tx_pkt_start = gp_start;
     	el_status.collisions = 0;
@@ -324,7 +320,7 @@ el_start_xmit(struct sk_buff *skb, struct device *dev)
 	inb(TX_STATUS);
 	outb(0x00, RX_BUF_CLR);	/* Set rx packet area to 0. */
 	outw(gp_start, GP_LOW);
-	port_write_b(DATAPORT,buf,skb->len);
+	outsb(DATAPORT,buf,skb->len);
 	outw(gp_start, GP_LOW);
 	outb(AX_XMIT, AX_CMD);		/* Trigger xmit.  */
 	dev->trans_start = jiffies;
@@ -467,7 +463,7 @@ el_receive(struct device *dev)
 	skb->len = pkt_len;
 	skb->dev = dev;
 
-	port_read_b(DATAPORT, (void *)(skb+1), pkt_len);
+	insb(DATAPORT, skb->data, pkt_len);
 
 #ifdef HAVE_NETIF_RX
 	    netif_rx(skb);

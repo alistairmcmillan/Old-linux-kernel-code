@@ -43,17 +43,18 @@
 
 #define OPT_HIGHLEVEL   5
 #define OPT_SBPRO	5
-#define OPT_AUDIO	6
-#define OPT_MIDI_AUTO	7
-#define OPT_MIDI	8
-#define OPT_YM3812_AUTO	9	/* Select this automaticly if user selects
+#define OPT_SB16	6
+#define OPT_AUDIO	7
+#define OPT_MIDI_AUTO	8
+#define OPT_MIDI	9
+#define OPT_YM3812_AUTO	10	/* Select this automaticly if user selects
 				 * MIDI or AdLib driver */
-#define OPT_YM3812	10	/* Select this if the previous one was not
+#define OPT_YM3812	11	/* Select this if the previous one was not
 				 * selected */
-#define OPT_SEQUENCER	11
-#define OPT_CHIP_MIDI   12	/* New support added at UW - Milwauklee UW -
+#define OPT_SEQUENCER	12
+#define OPT_CHIP_MIDI   13	/* New support added at UW - Milwauklee UW -
 				 * Milwauklee */
-#define OPT_LAST	11
+#define OPT_LAST	12
 
 #define ANY_DEVS (B(OPT_AUDIO)|B(OPT_MIDI)|B(OPT_SEQUENCER)|B(OPT_GUS)|B(OPT_MPU401))
 
@@ -64,6 +65,7 @@ typedef struct
     char            macro[20];
     int             verify;
     int             alias;
+    int		    default_answ;
   }
 
 hw_entry;
@@ -86,22 +88,23 @@ hw_entry;
 hw_entry        hw_table[] =
 {
 /* 0 */
-  {0, 0, "PAS", 1, 0},
-  {0, 0, "SB", 1, 0},
-  {0, B (OPT_PAS) | B (OPT_SB), "ADLIB", 1, 0},
+  {0, 0, "PAS", 1, 0, 0},
+  {0, 0, "SB", 1, 0, 0},
+  {0, B (OPT_PAS) | B (OPT_SB), "ADLIB", 1, 0, 0},
 
 /* 3 */
-  {0, 0, "GUS", 1, 0},
-  {0, 0, "MPU401", 1, 0},
-  {B (OPT_SB), B (OPT_PAS), "SBPRO", 1, 0},
-  {B (OPT_SB) | B (OPT_PAS) | B (OPT_GUS), 0, "AUDIO", 1, 0},
-  {B (OPT_MPU401), 0, "MIDI_AUTO", 0, OPT_MIDI},
-  {B (OPT_SB) | B (OPT_PAS) | B (OPT_MPU401) | B (OPT_GUS), 0, "MIDI", 1, 0},
-  {B (OPT_ADLIB), 0, "YM3812_AUTO", 0, OPT_YM3812},
-  {B (OPT_SB) | B (OPT_PAS) | B (OPT_ADLIB), B (OPT_YM3812_AUTO), "YM3812", 1, 0},
+  {0, 0, "GUS", 1, 0, 0},
+  {0, 0, "MPU401", 1, 0, 0},
+  {B (OPT_SB), B (OPT_PAS), "SBPRO", 1, 0, 1},
+  {B (OPT_SB) | B (OPT_SBPRO), B (OPT_PAS), "SB16", 1, 0, 1},
+  {B (OPT_SB) | B (OPT_PAS) | B (OPT_GUS), 0, "AUDIO", 1, 0, 1},
+  {B (OPT_MPU401), 0, "MIDI_AUTO", 0, OPT_MIDI, 0},
+  {B (OPT_SB) | B (OPT_PAS) | B (OPT_MPU401) | B (OPT_GUS), 0, "MIDI", 1, 0, 1},
+  {B (OPT_ADLIB), 0, "YM3812_AUTO", 0, OPT_YM3812, 0},
+  {B (OPT_SB) | B (OPT_PAS) | B (OPT_ADLIB), B (OPT_YM3812_AUTO), "YM3812", 1, 0, 1},
 /* 10 */
-  {B (OPT_MIDI) | B (OPT_YM3812) | B (OPT_YM3812_AUTO) | B (OPT_GUS), 0, "SEQUENCER", 0, 0},
-  {0, 0, "CHIP_MIDI", 1, 0}
+  {B (OPT_MIDI) | B (OPT_YM3812) | B (OPT_YM3812_AUTO) | B (OPT_GUS), 0, "SEQUENCER", 0, 0, 1},
+  {0, 0, "CHIP_MIDI", 1, 0, 0}
 };
 
 char           *questions[] =
@@ -110,19 +113,21 @@ char           *questions[] =
   "SoundBlaster support",
   "AdLib support",
   "Gravis Ultrasound support",
-  "MPU-401 support",
+  "MPU-401 support (NOT for SB16)",
 
-  "SoundBlaster Pro support (mixer)",
+  "SoundBlaster Pro support",
+  "SoundBlaster 16 support",
   "digitized voice support",
   "This should not be asked",
   "MIDI interface support",
   "This should not be asked",
-  "Internal synthesizer (FM/GUS) support",
+  "FM synthesizer (YM3812/OPL-3) support",
   "/dev/sequencer support",
   "MIDI on CHIP support"
 };
 
 unsigned long   selected_options = 0;
+int sb_dma = 0;
 
 int
 can_select_option (int nr)
@@ -165,7 +170,7 @@ can_select_option (int nr)
 }
 
 int
-think_positively (void)
+think_positively (int def_answ)
 {
   char            answ[512];
   int             len;
@@ -181,7 +186,7 @@ think_positively (void)
     }
 
   if (len < 2)			/* There is an additional LF at the end */
-    return 0;
+    return def_answ;
 
   answ[len - 1] = 0;
 
@@ -235,7 +240,7 @@ main (int argc, char *argv[])
 
   fprintf (stderr, "Do you want to include full version of the sound driver (n/y) ? ");
 
-  if (think_positively ())
+  if (think_positively (0))
     {
       selected_options = 0xffffffff & ~B (OPT_MPU401);
       fprintf (stderr, "Note! MPU-401 driver was not enabled\n");
@@ -244,7 +249,7 @@ main (int argc, char *argv[])
   else
     {
       fprintf (stderr, "Do you want to DISABLE the Sound Driver (n/y) ?");
-      if (think_positively ())
+      if (think_positively (0))
 	{
 	  printf ("#undef CONFIGURE_SOUNDCARD\n");
 	  printf ("#undef KERNEL_SOUNDCARD\n");
@@ -267,8 +272,12 @@ main (int argc, char *argv[])
 		}
 	      else
 		{
-		  fprintf (stderr, "  %s (n/y) ? ", questions[i]);
-		  if (think_positively ())
+		  int def_answ = hw_table[i].default_answ;
+
+		  fprintf (stderr, 
+		     def_answ ? "  %s (y/n) ? " : "  %s (n/y) ? ", 
+		     questions[i]);
+		  if (think_positively (def_answ))
 		    if (hw_table[i].alias)
 		      selected_options |= B (hw_table[i].alias);
 		    else
@@ -276,6 +285,9 @@ main (int argc, char *argv[])
 		}
 	  }
     }
+
+  if (selected_options & B(OPT_SB16))
+     selected_options |= B(OPT_SBPRO);
 
   if (!(selected_options & ANY_DEVS))
     {
@@ -303,7 +315,7 @@ main (int argc, char *argv[])
    */
   printf ("\n");
 
-#ifdef linux
+#if defined(linux)
   if (selected_options & B (OPT_SB) && selected_options & (B (OPT_AUDIO) | B (OPT_MIDI)))
     {
       fprintf (stderr, "\nIRQ number for SoundBlaster?\n"
@@ -327,11 +339,12 @@ main (int argc, char *argv[])
 	  fprintf (stderr, "\nDMA channel for SoundBlaster?\n"
 		   "For SB 1.0, 1.5 and 2.0 this MUST be 1\n"
 		   "SB Pro supports DMA channels 0, 1 and 3 (jumper)\n"
+		   "For SB16 give the 8 bit DMA# here\n"
 		   "The default value is 1\n"
 		   "Enter the value: ");
 
 	  num = ask_value ("%d", 1);
-	  if (num < 0 || num > 7 || num == 4)
+	  if (num < 0 || num > 3)
 	    {
 
 	      fprintf (stderr, "*** Illegal input! ***\n");
@@ -339,6 +352,35 @@ main (int argc, char *argv[])
 	    }
 	  fprintf (stderr, "SoundBlaster DMA set to %d\n", num);
 	  printf ("#define SBC_DMA %d\n", num);
+	  sb_dma = num;
+	}
+
+      if (selected_options & B (OPT_SB16))
+	{
+
+	  fprintf (stderr, "\n16 bit DMA channel for SoundBlaster 16?\n"
+	  	   "Possible values are 5, 6 or 7\n"
+		   "The default value is 6\n"
+		   "Enter the value: ");
+
+	  num = ask_value ("%d", 6);
+	  if ((num < 5 || num > 7) && (num != sb_dma))
+	    {
+
+	      fprintf (stderr, "*** Illegal input! ***\n");
+	      num = 6;
+	    }
+	  fprintf (stderr, "SoundBlaster DMA set to %d\n", num);
+	  printf ("#define SB16_DMA %d\n", num);
+
+          fprintf (stderr, "\nI/O base for SB16 Midi?\n"
+	       "Possible values are 300 and 330\n"
+	       "The factory default is 330\n"
+	       "Enter the SB16 Midi I/O base: ");
+
+          num = ask_value ("%x", 0x330);
+          fprintf (stderr, "SB16 Midi I/O base set to %03x\n", num);
+          printf ("#define SB16MIDI_BASE 0x%03x\n", num);
 	}
     }
 
@@ -453,7 +495,7 @@ main (int argc, char *argv[])
       printf ("#define MPU_BASE 0x%03x\n", num);
 
       fprintf (stderr, "\nIRQ number for MPU-401?\n"
-	       "Valid numbers are: 3, 4, 5, 7 and 9.\n"
+	       "Valid numbers are: 3, 4, 5, 7 and 9(=2).\n"
 	       "The default value is 5.\n"
 	       "Enter the value: ");
 
@@ -473,10 +515,14 @@ main (int argc, char *argv[])
     {
       def_size = 16384;
 
-      if (selected_options & (B (OPT_SBPRO) | B (OPT_PAS)))
+      if (selected_options & (B (OPT_SBPRO) | B (OPT_PAS) | B(OPT_SB16)))
 	def_size = 32768;
-      if ((selected_options & B (OPT_PAS)) && !full_driver)
-	def_size = 65536;	/* PAS16 alone */
+
+#ifndef __386BSD__
+      if (((selected_options & B (OPT_PAS)) || (selected_options & B (OPT_SB16))) && 
+          !full_driver)
+	def_size = 65536;	/* PAS16 or SB16 */
+#endif
 
       fprintf (stderr, "\nSelect the DMA buffer size (4096, 16384, 32768 or 65536 bytes)\n"
 	       "%d is recommended value for this configuration.\n"
@@ -495,6 +541,10 @@ main (int argc, char *argv[])
 
   printf ("#define SELECTED_SOUND_OPTIONS\t0x%08x\n", selected_options);
   fprintf (stderr, "The sound driver is now configured.\n");
+
+#if defined(SCO) || defined(ISC) || defined(SYSV)
+	fprintf(stderr, "Rember to update the System file\n");
+#endif
 
   exit (0);
 }

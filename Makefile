@@ -1,5 +1,5 @@
 VERSION = 0.99
-PATCHLEVEL = 14
+PATCHLEVEL = 15
 ALPHA =
 
 all:	Version zImage
@@ -44,16 +44,17 @@ ROOT_DEV = CURRENT
 # The number is the same as you would ordinarily press at bootup.
 #
 
-SVGA_MODE=	-DSVGA_MODE=3
-
-# Special options.
-#OPTS	= -pro
+SVGA_MODE=	-DSVGA_MODE=NORMAL_VGA
 
 #
 # standard CFLAGS
 #
 
-CFLAGS = -Wall -Wstrict-prototypes -O6 -fomit-frame-pointer -pipe # -x c++
+CFLAGS = -Wall -Wstrict-prototypes -O2 -fomit-frame-pointer -pipe
+
+ifdef CONFIG_CPP
+CFLAGS := $(CFLAGS) -x c++
+endif
 
 ifdef CONFIG_M486
 CFLAGS := $(CFLAGS) -m486
@@ -134,14 +135,13 @@ tools/version.h: $(CONFIGURE) Makefile
 	@echo \#define LINUX_COMPILE_HOST \"`hostname`\" >> tools/version.h
 	@echo \#define LINUX_COMPILE_DOMAIN \"`domainname`\" >> tools/version.h
 
-tools/build: $(CONFIGURE) tools/build.c
-	$(HOSTCC) $(CFLAGS) \
-	-o tools/build tools/build.c
+tools/build: tools/build.c $(CONFIGURE)
+	$(HOSTCC) $(CFLAGS) -o $@ $<
 
 boot/head.o: $(CONFIGURE) boot/head.s
 
-boot/head.s: $(CONFIGURE) boot/head.S include/linux/tasks.h
-	$(CPP) -traditional boot/head.S -o boot/head.s
+boot/head.s: boot/head.S $(CONFIGURE) include/linux/tasks.h
+	$(CPP) -traditional $< -o $@
 
 tools/version.o: tools/version.c tools/version.h
 
@@ -149,26 +149,32 @@ init/main.o: $(CONFIGURE) init/main.c
 	$(CC) $(CFLAGS) $(PROFILING) -c -o $*.o $<
 
 tools/system:	boot/head.o init/main.o tools/version.o linuxsubdirs
-	$(LD) $(LDFLAGS) -T 1000 -M boot/head.o init/main.o tools/version.o \
+	$(LD) $(LDFLAGS) -T 1000 boot/head.o init/main.o tools/version.o \
 		$(ARCHIVES) \
 		$(FILESYSTEMS) \
 		$(DRIVERS) \
 		$(LIBS) \
-		-o tools/system > System.map
+		-o tools/system
+	nm tools/zSystem | grep -v '\(compiled\)\|\(\.o$$\)\|\( a \)' | \
+		sort > System.map
 
-boot/setup: boot/setup.s
-	$(AS86) -o boot/setup.o boot/setup.s
-	$(LD86) -s -o boot/setup boot/setup.o
+boot/setup: boot/setup.o
+	$(LD86) -s -o $@ $<
 
-boot/setup.s: $(CONFIGURE) boot/setup.S include/linux/config.h Makefile
-	$(CPP) -traditional $(SVGA_MODE) $(RAMDISK) boot/setup.S -o boot/setup.s
+boot/setup.o: boot/setup.s
+	$(AS86) -o $@ $<
 
-boot/bootsect.s: $(CONFIGURE) boot/bootsect.S include/linux/config.h Makefile
-	$(CPP) -traditional $(SVGA_MODE) $(RAMDISK) boot/bootsect.S -o boot/bootsect.s
+boot/setup.s: boot/setup.S $(CONFIGURE) include/linux/config.h Makefile
+	$(CPP) -traditional $(SVGA_MODE) $(RAMDISK) $< -o $@
 
-boot/bootsect:	boot/bootsect.s
-	$(AS86) -o boot/bootsect.o boot/bootsect.s
-	$(LD86) -s -o boot/bootsect boot/bootsect.o
+boot/bootsect: boot/bootsect.o
+	$(LD86) -s -o $@ $<
+
+boot/bootsect.o: boot/bootsect.s
+	$(AS86) -o $@ $<
+
+boot/bootsect.s: boot/bootsect.S $(CONFIGURE) include/linux/config.h Makefile
+	$(CPP) -traditional $(SVGA_MODE) $(RAMDISK) $< -o $@
 
 zBoot/zSystem: zBoot/*.c zBoot/*.S tools/zSystem
 	$(MAKE) -C zBoot
@@ -183,16 +189,17 @@ zdisk: zImage
 zlilo: $(CONFIGURE) zImage
 	if [ -f /vmlinuz ]; then mv /vmlinuz /vmlinuz.old; fi
 	cat zImage > /vmlinuz
-	/etc/lilo/install
-
+	if [ -x /sbin/lilo ]; then /sbin/lilo; else /etc/lilo/install; fi
 
 tools/zSystem:	boot/head.o init/main.o tools/version.o linuxsubdirs
-	$(LD) $(LDFLAGS) -T 100000 -M boot/head.o init/main.o tools/version.o \
+	$(LD) $(LDFLAGS) -T 100000 boot/head.o init/main.o tools/version.o \
 		$(ARCHIVES) \
 		$(FILESYSTEMS) \
 		$(DRIVERS) \
 		$(LIBS) \
-		-o tools/zSystem > zSystem.map
+		-o tools/zSystem
+	nm tools/zSystem | grep -v '\(compiled\)\|\(\.o$$\)\|\( a \)' | \
+		sort > zSystem.map
 
 fs: dummy
 	$(MAKE) linuxsubdirs SUBDIRS=fs
@@ -202,6 +209,9 @@ lib: dummy
 
 mm: dummy
 	$(MAKE) linuxsubdirs SUBDIRS=mm
+
+ipc: dummy
+	$(MAKE) linuxsubdirs SUBDIRS=ipc
 
 kernel: dummy
 	$(MAKE) linuxsubdirs SUBDIRS=kernel
@@ -213,6 +223,7 @@ net: dummy
 	$(MAKE) linuxsubdirs SUBDIRS=net
 
 clean:
+	rm -f kernel/ksyms.lst
 	rm -f core `find . -name '*.[oas]' -print`
 	rm -f core `find . -name 'core' -print`
 	rm -f zImage zSystem.map tools/zSystem tools/system

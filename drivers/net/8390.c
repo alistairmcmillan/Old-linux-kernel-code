@@ -36,7 +36,6 @@ static char *version =
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/fs.h>
-#include <linux/tty.h>
 #include <linux/types.h>
 #include <linux/ptrace.h>
 #include <linux/string.h>
@@ -161,7 +160,7 @@ static int ei_start_xmit(struct sk_buff *skb, struct device *dev)
 		return 0;
     }
     /* Fill in the ethernet header. */
-    if (!skb->arp  &&  dev->rebuild_header(skb+1, dev)) {
+    if (!skb->arp  &&  dev->rebuild_header(skb->data, dev)) {
 		skb->dev = dev;
 		arp_queue (skb);
 		return 0;
@@ -220,7 +219,7 @@ static int ei_start_xmit(struct sk_buff *skb, struct device *dev)
 			return 1;
 		}
 		dev->trans_start = jiffies;
-		ei_block_output(dev, length, (unsigned char *)(skb+1), output_page);
+		ei_block_output(dev, length, skb->data, output_page);
 		if (! ei_local->txing) {
 			NS8390_trigger_send(dev, send_length, output_page);
 			if (output_page == ei_local->tx_start_page)
@@ -234,7 +233,7 @@ static int ei_start_xmit(struct sk_buff *skb, struct device *dev)
 			tmp_tbusy = 1;
     } else {
 		dev->trans_start = jiffies;
-		ei_block_output(dev, length, (unsigned char *)(skb+1),
+		ei_block_output(dev, length, skb->data,
 						ei_local->tx_start_page);
 		NS8390_trigger_send(dev, send_length, ei_local->tx_start_page);
 		tmp_tbusy = 1;
@@ -496,8 +495,8 @@ static void ei_receive(struct device *dev)
 				skb->len = pkt_len;
 				skb->dev = dev;
 				
-				/* 'skb+1' points to the start of sk_buff data area. */
-				ei_block_input(dev, pkt_len, (char *)(skb+1),
+				/* 'skb->data' points to the start of sk_buff data area. */
+				ei_block_input(dev, pkt_len, (char *) skb->data,
 							   current_offset + sizeof(rx_frame));
 #ifdef HAVE_NETIF_RX
 				netif_rx(skb);

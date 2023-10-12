@@ -28,7 +28,6 @@
 #include <linux/stat.h>
 #include <linux/socket.h>
 #include <linux/fcntl.h>
-#include <linux/termios.h>
 #include <linux/net.h>
 #include <linux/ddi.h>
 
@@ -69,11 +68,13 @@ static struct file_operations socket_file_ops = {
   NULL,			/* no special open code... */
   sock_close
 };
-struct socket sockets[NSOCKETS];
+
+static struct socket sockets[NSOCKETS];
 static struct wait_queue *socket_wait_free = NULL;
 static struct proto_ops *pops[NPROTO];
 static int net_debug = 0;
 
+#define last_socket	(sockets + NSOCKETS - 1)
 
 #ifdef SOCK_DEBUG
 /* Module debugging. */
@@ -138,8 +139,16 @@ socki_lookup(struct inode *inode)
 {
   struct socket *sock;
 
+  if ((sock = inode->i_socket) != NULL) {
+	if (sock->state != SS_FREE && SOCK_INODE(sock) == inode)
+		return sock;
+	printk("socket.c: uhhuh. stale inode->i_socket pointer\n");
+  }
   for (sock = sockets; sock <= last_socket; ++sock)
-	if (sock->state != SS_FREE && SOCK_INODE(sock) == inode) return(sock);
+	if (sock->state != SS_FREE && SOCK_INODE(sock) == inode) {
+		printk("socket.c: uhhuh. Found socket despite no inode->i_socket pointer\n");
+		return(sock);
+	}
   return(NULL);
 }
 
@@ -187,6 +196,7 @@ sock_alloc(int wait)
 			SOCK_INODE(sock)->i_mode = S_IFSOCK;
 			SOCK_INODE(sock)->i_uid = current->euid;
 			SOCK_INODE(sock)->i_gid = current->egid;
+			SOCK_INODE(sock)->i_socket = sock;
 
 			sock->wait = &SOCK_INODE(sock)->i_wait;
 			DPRINTF((net_debug,
@@ -212,7 +222,7 @@ static inline void
 sock_release_peer(struct socket *peer)
 {
   peer->state = SS_DISCONNECTING;
-  wake_up(peer->wait);
+  wake_up_interruptible(peer->wait);
 }
 
 
@@ -220,6 +230,7 @@ static void
 sock_release(struct socket *sock)
 {
   int oldstate;
+  struct inode *inode;
   struct socket *peersock, *nextsock;
 
   DPRINTF((net_debug, "NET: sock_release: socket 0x%x, inode 0x%x\n",
@@ -240,11 +251,12 @@ sock_release(struct socket *sock)
   peersock = (oldstate == SS_CONNECTED) ? sock->conn : NULL;
   if (sock->ops) sock->ops->release(sock, peersock);
   if (peersock) sock_release_peer(peersock);
+  inode = SOCK_INODE(sock);
   sock->state = SS_FREE;		/* this really releases us */
-  wake_up(&socket_wait_free);
+  wake_up_interruptible(&socket_wait_free);
 
   /* We need to do this. If sock alloc was called we already have an inode. */
-  iput(SOCK_INODE(sock));
+  iput(inode);
 }
 
 
@@ -379,7 +391,7 @@ sock_awaitconn(struct socket *mysock, struct socket *servsock)
    * Wake up server, then await connection. server will set state to
    * SS_CONNECTED if we're connected.
    */
-  wake_up(servsock->wait);
+  wake_up_interruptible(servsock->wait);
   if (mysock->state != SS_CONNECTED) {
 	interruptible_sleep_on(mysock->wait);
 	if (mysock->state != SS_CONNECTED &&

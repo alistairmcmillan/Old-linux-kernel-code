@@ -1,10 +1,10 @@
-/* fdomain.c -- Future Domain TMC-16x0 driver
+/* fdomain.c -- Future Domain TMC-16x0 SCSI driver
  * Created: Sun May  3 18:53:19 1992 by faith@cs.unc.edu
- * Revised: Sun Oct 31 19:53:49 1993 by faith@cs.unc.edu
+ * Revised: Sun Jan 23 08:59:04 1994 by faith@cs.unc.edu
  * Author: Rickard E. Faith, faith@cs.unc.edu
- * Copyright 1992, 1993 Rickard E. Faith
+ * Copyright 1992, 1993, 1994 Rickard E. Faith
  *
- * $Id: fdomain.c,v 5.6 1993/11/01 02:40:32 root Exp $
+ * $Id: fdomain.c,v 5.9 1994/01/23 13:59:14 root Exp $
 
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -144,7 +144,7 @@
 #include <linux/string.h>
 #include <linux/ioport.h>
 
-#define VERSION          "$Revision: 5.6 $"
+#define VERSION          "$Revision: 5.9 $"
 
 /* START OF USER DEFINABLE OPTIONS */
 
@@ -305,6 +305,7 @@ struct signature {
    /*          1         2         3         4         5         6 */
    /* 123456789012345678901234567890123456789012345678901234567890 */
    { "FUTURE DOMAIN CORP. (C) 1986-1990 1800-V2.07/28/89", 5, 50,  2,  0 },
+   { "FUTURE DOMAIN CORP. (C) 1986-1990 1800-V1.07/28/89", 5, 50,  2,  0 },
    { "FUTURE DOMAIN CORP. (C) 1992 V3.00.004/02/92",       5, 44,  3,  0 },
    { "FUTURE DOMAIN TMC-18XX (C) 1993 V3.203/12/93",       5, 44,  3,  2 },
    { "FUTURE DOMAIN TMC-18XX",                             5, 22, -1, -1 },
@@ -323,37 +324,6 @@ struct signature {
 };
 
 #define SIGNATURE_COUNT (sizeof( signatures ) / sizeof( struct signature ))
-
-
-/* These functions are based on include/asm/io.h */
-
-inline static unsigned short inw( unsigned short port )
-{
-   unsigned short _v;
-   
-   __asm__ volatile ( "inw %1,%0"
-		      :"=a" (_v):"d" ((unsigned short) port) );
-   return _v;
-}
-
-inline static void outw( unsigned short value, unsigned short port )
-{
-   __asm__ volatile ( "outw %0,%1"
-		      : :"a" ((unsigned short) value),
-		      "d" ((unsigned short) port) );
-}
-
-
-/* These defines are copied from kernel/blk_drv/hd.c */
-
-#define insw( buf, count, port ) \
-   __asm__ volatile \
-      ("cld;rep;insw": :"d" (port),"D" (buf),"c" (count):"cx","di" )
-
-#define outsw( buf, count, port ) \
-    __asm__ volatile \
-       ("cld;rep;outsw": :"d" (port),"S" (buf),"c" (count):"cx","si")
-
 
 static void print_banner( void )
 {
@@ -1113,7 +1083,7 @@ void fdomain_16x0_intr( int unused )
 	       --current_SC->SCp.this_residual;
 	    } else {
 	       data_count >>= 1;
-	       outsw( current_SC->SCp.ptr, data_count, Write_FIFO_port );
+	       outsw( Write_FIFO_port, current_SC->SCp.ptr, data_count );
 	       current_SC->SCp.ptr += 2 * data_count;
 	       current_SC->SCp.this_residual -= 2 * data_count;
 	    }
@@ -1146,7 +1116,7 @@ void fdomain_16x0_intr( int unused )
 	       --current_SC->SCp.this_residual;
 	    } else {
 	       data_count >>= 1; /* Number of words */
-	       insw( current_SC->SCp.ptr, data_count, Read_FIFO_port );
+	       insw( Read_FIFO_port, current_SC->SCp.ptr, data_count );
 	       current_SC->SCp.ptr += 2 * data_count;
 	       current_SC->SCp.this_residual -= 2 * data_count;
 	    }
